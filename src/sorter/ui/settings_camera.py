@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..hardware.camera import Camera, camera_names, list_cameras_with_metadata
+from .device_registry import in_use_label
 from .message_log import ERROR
 
 PREVIEW_INITIAL_TEXT = "No frame"
@@ -136,15 +137,41 @@ class CameraSection(QWidget):
         self.status_label.setText("Click Detect / refresh to probe supported resolutions.")
 
     def _fill_device_combo(self, *, select_index: int) -> None:
+        """One entry per camera; a camera another tab holds is listed but not selectable."""
+        held = self._win.devices.cameras_held_by_others(self._win.sorter_id)
+        entries = list(self._detected)
+        # Detect never opens a held device, so it can't report one: list it
+        # anyway, from the name-only enumeration, so it doesn't just vanish.
+        known = {int(cam["index"]) for cam in entries}
+        names = camera_names() if any(index not in known for index in held) else {}
+        for index in sorted(held):
+            if index not in known:
+                entries.append({"index": index, "name": names.get(index, f"Camera {index}"), "resolutions": []})
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        for cam in self._detected:
-            self.device_combo.addItem(_format_camera_choice(cam), cam)
-        if self._detected:
-            match = next((i for i, cam in enumerate(self._detected) if cam["index"] == select_index), 0)
+        model = self.device_combo.model()
+        for cam in entries:
+            holder = held.get(int(cam["index"]))
+            label = _format_camera_choice(cam)
+            self.device_combo.addItem(label if holder is None else f"{label} ({in_use_label(holder)})", cam)
+            if holder is not None and isinstance(model, QStandardItemModel):
+                item = model.item(self.device_combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
+        free = [i for i, cam in enumerate(entries) if int(cam["index"]) not in held]
+        if free:
+            match = next((i for i in free if int(entries[i]["index"]) == select_index), free[0])
             self.device_combo.setCurrentIndex(match)
+        else:
+            self.device_combo.setCurrentIndex(-1)
         self.device_combo.blockSignals(False)
         self._fill_resolution_combo()
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        # Another tab may have taken or released a camera since this page was
+        # last drawn; re-labelling is cheap and opens nothing.
+        self._fill_device_combo(select_index=int(self._win.config.camera.get("device_index", 0)))
 
     def _fill_resolution_combo(self) -> None:
         cam = self.device_combo.currentData()
@@ -177,8 +204,10 @@ class CameraSection(QWidget):
     def detect_devices(self) -> None:
         self.detect_button.setEnabled(False)
         self.status_label.setText("Detecting cameras… (opens each device)")
+        # A camera another tab is streaming from is never opened by the probe.
+        held = set(self._win.devices.cameras_held_by_others(self._win.sorter_id))
         self._win.run_worker(
-            list_cameras_with_metadata,
+            lambda: list_cameras_with_metadata(skip=held),
             on_done=self._on_detect_done,
             on_error=self._on_detect_error,
         )
@@ -201,7 +230,7 @@ class CameraSection(QWidget):
     # ----- apply -------------------------------------------------------------
 
     def apply_camera(self) -> None:
-        """Swap the live camera in place — mirrors ``ui.app.MainWindow.restart_camera``."""
+        """Swap this tab's live camera in place, after claiming the new device for it."""
         cam = self.device_combo.currentData()
         if cam is None:
             self._win.set_status("No camera selected.")
@@ -210,6 +239,11 @@ class CameraSection(QWidget):
         cam_cfg = self._win.config.camera
         width = int(wh[0]) if wh else int(cam_cfg.get("width", 640))
         height = int(wh[1]) if wh else int(cam_cfg.get("height", 480))
+        holder = self._win.devices.claim_camera(int(cam["index"]), self._win.sorter_id)
+        if holder is not None:
+            # Refused before this tab's own camera is touched.
+            self._win.set_status(f"Camera {cam['index']} is {in_use_label(holder)}.")
+            return
 
         self._win.camera.stop()
         new_camera = Camera(device_index=int(cam["index"]), width=width, height=height)

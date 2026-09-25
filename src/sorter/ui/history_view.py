@@ -113,13 +113,13 @@ def _parse_zoom_percent(raw: Any) -> int:
     return max(ZOOM_MIN, min(ZOOM_MAX, value))
 
 
-def _bgr_to_pixmap(image: Any, size: int) -> QPixmap:
+def bgr_to_pixmap(image: Any, size: int) -> QPixmap:
     """A BGR numpy frame as a square QPixmap; anything else renders blank.
 
     ``QImage`` borrows the buffer it is handed, so ``.copy()`` cuts the result
-    loose — same technique as ``ui.app.frame_to_image`` and
-    ``dialog_image_preview.bgr_to_pixmap``, duplicated rather than imported so
-    this module has no dependency on the main window or another dialog.
+    loose — same technique as ``sorter_tab.frame_to_image`` and
+    ``dialog_image_preview.bgr_to_pixmap``. Public because the "All sorters"
+    dashboard renders its thumbnails with it too.
     """
     if not isinstance(image, np.ndarray) or image.size == 0:
         pixmap = QPixmap(size, size)
@@ -215,7 +215,7 @@ class HistoryEntry(QFrame):
 
     def set_record(self, record: dict[str, Any]) -> None:
         self.record = record
-        self.thumb_label.setPixmap(_bgr_to_pixmap(record.get("image"), self._thumb))
+        self.thumb_label.setPixmap(bgr_to_pixmap(record.get("image"), self._thumb))
         label = str(record.get("label") or "(empty)")
         parent = record.get("parent")
         self.label_label.setText(f"{parent} · {label}" if parent else label)
@@ -266,7 +266,7 @@ class HistoryPreviewDialog(QDialog):
         self.image_label.setObjectName("imagePreview")
         self.image_label.setFixedSize(PREVIEW_SIZE, PREVIEW_SIZE)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setPixmap(_bgr_to_pixmap(record.get("image"), PREVIEW_SIZE))
+        self.image_label.setPixmap(bgr_to_pixmap(record.get("image"), PREVIEW_SIZE))
         column.addWidget(self.image_label)
 
         label = str(record.get("label") or "(empty)")
@@ -462,12 +462,44 @@ class HistoryView(QWidget):
     def _on_history(self, payload: Any) -> None:
         if not isinstance(payload, dict):
             return
-        # Stamp the running case number here, on the LIVE path only — a zoom
-        # replay reuses the stored dicts, so every record keeps the number it
-        # arrived with (WinForms keeps counting across runs; so does this).
-        self._case_number += 1
-        payload = {**payload, "number": self._case_number}
+        # The running case number (WinForms keeps counting across runs; so
+        # does this). A sorter tab stamps it before this handler runs, so the
+        # panel and the tab's replay buffer agree; a host that doesn't gets
+        # the panel's own count. Live path only: a zoom or retarget replay
+        # reuses the stored dicts, so every record keeps the number it had.
+        number = payload.get("number")
+        if not isinstance(number, int):
+            self._case_number += 1
+            payload = {**payload, "number": self._case_number}
         self._push_record(payload)
+
+    def retarget(self, host: Any) -> None:
+        """Follow another sorter tab: its bus, its floor, its recent cases.
+
+        The panel is one dock shared by every tab, so bringing a tab to the
+        front moves the subscription to that tab's bus and replays the
+        records the tab kept (``history_records``), each with the number it
+        was given when it arrived.
+        """
+        if host is self._win:
+            return
+        self.unsubscribe()
+        self._win = host
+        host.bus.subscribe("run/history", self._on_history)
+        records = list(getattr(host, "history_records", ()))
+        for tile in self._tiles:
+            self._grid.removeWidget(tile)
+            tile.deleteLater()
+        self._tiles = []
+        self._entries = []
+        self._write_index = 0
+        self._cols = -1
+        self._rows = -1
+        self._capacity = -1
+        self._recompute_capacity()
+        for record in records:
+            self._push_record(record)
+        self._update_empty_state()
 
     def _make_tile(self) -> HistoryEntry:
         tile = HistoryEntry(self.grid_area, self._tile_w, self._tile_h, self._thumb, self._factor)

@@ -44,8 +44,7 @@ def _data_root(tmp_path: Path, monkeypatch) -> None:
 
 
 def _set_api_key(config: Any, value: str) -> None:
-    config.api["api_key"] = value
-    config.save()
+    config.save_api({**config.api, "api_key": value})
 
 
 class _Recorder:

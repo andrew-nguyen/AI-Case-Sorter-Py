@@ -29,7 +29,7 @@ from sorter.ui.dialog_headstamp_assign import (
 from sorter.ui.formatting import EMPTY_VALUE
 from sorter.ui.slot_grid import EMPTY_HINT
 
-from .conftest import seed_model
+from .conftest import seed_model, tab
 
 NINE_MM = {"WIN 9MM LUGER": 0, "FC 9MM LUGER": 0, "WIN .45 AUTO": 0, "S B 9MM LUGER": 0}
 
@@ -39,8 +39,8 @@ def assigner(window):
     """Open the view through the Sort page's own entry point."""
 
     def _open() -> HeadstampAssignDialog:
-        window.open_headstamp_assign()
-        dialog = window.headstamp_assign_dialog
+        tab(window).open_headstamp_assign()
+        dialog = tab(window).headstamp_assign_dialog
         assert dialog is not None
         return dialog
 
@@ -48,7 +48,7 @@ def assigner(window):
 
 
 def stored_slots(config) -> dict[str, int]:
-    return {e["name"]: int(e["slot"]) for e in Config(config.db).load().headstamps}
+    return {e["name"]: int(e["slot"]) for e in Config(config.db, sorter_id=1).load().headstamps}
 
 
 def cell(dialog: HeadstampAssignDialog, row: int, column: int) -> QTableWidgetItem:
@@ -76,12 +76,14 @@ def type_keys(dialog: HeadstampAssignDialog, *keys: Qt.Key) -> None:
 
 
 def test_the_sort_page_button_opens_the_view(window) -> None:
-    seed_model(window.config, {"9mm FC": 0})
+    seed_model(tab(window).config, {"9mm FC": 0})
 
-    QTest.mouseClick(window.assign_by_headstamp_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(tab(window).assign_by_headstamp_button, Qt.MouseButton.LeftButton)
 
-    dialog = window.headstamp_assign_dialog
+    dialog = tab(window).headstamp_assign_dialog
     assert isinstance(dialog, HeadstampAssignDialog)
+    # Parented to this tab's page, so it belongs to the tab it edits.
+    assert dialog.parent() is tab(window).sort_page
     assert dialog.isVisible()
     assert dialog.focusWidget() is dialog.filter_edit
 
@@ -91,7 +93,7 @@ def test_closing_the_view_lets_it_go(window, assigner) -> None:
 
     dialog.reject()
 
-    assert window.headstamp_assign_dialog is None
+    assert tab(window).headstamp_assign_dialog is None
 
 
 def test_every_headstamp_is_listed_with_its_slot(config, assigner) -> None:
@@ -152,8 +154,8 @@ def test_a_digit_routes_the_current_row_and_repaints_the_cards(window, config, a
     assert stored_slots(config) == {"WIN 9MM LUGER": 3, "FC 9MM LUGER": 0}
     assert table(dialog)["WIN 9MM LUGER"] == "3"
     # Live, while the dialog is still open.
-    assert window.slot_grid.cards[3].names_label.text() == "WIN 9MM LUGER"
-    assert window.slot_grid.cards[1].names_label.text() == EMPTY_HINT
+    assert tab(window).slot_grid.cards[3].names_label.text() == "WIN 9MM LUGER"
+    assert tab(window).slot_grid.cards[1].names_label.text() == EMPTY_HINT
 
 
 def test_a_whole_layout_in_one_keyboard_pass(config, assigner) -> None:
@@ -203,7 +205,7 @@ def test_zero_delete_and_backspace_send_a_row_to_the_catch_all(window, config, a
 
     assert stored_slots(config) == {"9mm FC": 0}
     assert table(dialog)["9mm FC"] == EMPTY_VALUE
-    assert window.slot_grid.cards[5].names_label.text() == EMPTY_HINT
+    assert tab(window).slot_grid.cards[5].names_label.text() == EMPTY_HINT
 
 
 def test_a_slot_the_machine_does_not_have_is_refused(config, assigner) -> None:
@@ -318,7 +320,7 @@ def test_ai_config_mode_edits_the_settings_backed_headstamps(window, config, ass
     type_keys(dialog, Qt.Key.Key_5)
 
     assert stored_slots(config) == {"9mm RP": 5}
-    assert window.slot_grid.cards[5].names_label.text() == "9mm RP"
+    assert tab(window).slot_grid.cards[5].names_label.text() == "9mm RP"
 
 
 @pytest.fixture
@@ -359,7 +361,7 @@ def test_parent_mode_routes_through_the_group(window, parent_model, assigner) ->
 
     assert [p["slot"] for p in parent_model.parents_with_slots()] == [2]
     assert parent_model.active_slot_template().assignments["parents"] == {"Winchester": 2}
-    assert window.slot_grid.cards[2].names_label.text() == "Winchester"
+    assert tab(window).slot_grid.cards[2].names_label.text() == "Winchester"
 
 
 def test_standard_mode_hides_the_contains_column(config, assigner) -> None:
@@ -383,7 +385,7 @@ def test_package_mode_digits_toggle_slots(window, package_model, assigner) -> No
     type_keys(dialog, Qt.Key.Key_1, Qt.Key.Key_3)
     assert package_model.slots_for_headstamp_package("9mm FC") == [1, 3]
     assert table(dialog)["9mm FC"] == "1, 3"
-    assert window.slot_grid.cards[3].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[3].names_label.text() == "9mm FC"
 
     type_keys(dialog, Qt.Key.Key_1)
     assert package_model.slots_for_headstamp_package("9mm FC") == [3]

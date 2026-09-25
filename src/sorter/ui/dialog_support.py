@@ -48,7 +48,7 @@ class SupportDialog(QDialog):
         self.setWindowTitle("Get support")
         self.resize(640, 520)
 
-        self.report_text = collect_report(win.config, win.config.db)
+        self.report_text = collect_report(win.current_tab.config, win.db)
 
         # Attributes, not methods: a test drives every path without a modal.
         self.notify: Callable[[str, str], None] = self._notify
@@ -94,7 +94,7 @@ class SupportDialog(QDialog):
         if not raw:
             return
         try:
-            written = write_bundle(Path(raw), self._win.config, self._win.config.db)
+            written = write_bundle(Path(raw), self._win.current_tab.config, self._win.db)
         except OSError as exc:
             self.notify("Save failed", str(exc))
             return

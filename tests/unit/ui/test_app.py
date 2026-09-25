@@ -17,6 +17,8 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtGui import QPixmap
 
+from .conftest import tab
+
 
 def test_sidebar_activities(window) -> None:
     # Two groups: the always-live surfaces, then the mode pair (Train first —
@@ -110,8 +112,8 @@ def test_a_muted_activity_is_inked_apart_from_its_neighbours(window, config) -> 
     from .conftest import seed_model
 
     seed_model(config, {"9mm FC": 1})
-    window.bus.post("mode/changed", None)
-    window.bus.drain()
+    tab(window).bus.post("mode/changed", None)
+    window.drain_all()
 
     assert train.property("unavailable") is False
     assert train.icon().pixmap(SIDEBAR_ICON_SIZE).toImage() == rendered(window.palette_colors["text_muted"])
@@ -128,18 +130,18 @@ def test_sidebar_fits_the_widest_label(window) -> None:
 def test_sort_actions_are_disabled_without_a_board(window) -> None:
     # Dict order follows the strip: Start/Stop last = the green primary at
     # the far right (JL), matching the Training strip.
-    assert list(window.action_buttons) == ["Manual feed", "Start/Stop"]
-    assert not any(button.isEnabled() for button in window.action_buttons.values())
+    assert list(tab(window).action_buttons) == ["Manual feed", "Start/Stop"]
+    assert not any(button.isEnabled() for button in tab(window).action_buttons.values())
     # The idle face, so the row reads "Start" even when nothing can start.
-    assert window.run_button.text() == "Start"
-    assert window.run_button.objectName() == "action"
+    assert tab(window).run_button.text() == "Start"
+    assert tab(window).run_button.objectName() == "action"
 
 
 def test_serial_dock_logs_traffic(window) -> None:
     assert not window.serial_dock.isClosed()
 
-    window.bus.post("serial/rx", "ok")
-    window.bus.drain()
+    tab(window).bus.post("serial/rx", "ok")
+    window.drain_all()
 
     assert "<- ok" in window.serial_monitor.output.toPlainText()
 
@@ -243,7 +245,7 @@ def test_run_worker_replies_are_one_shot_and_unsubscribed(window) -> None:
     window.run_worker(lambda: "first", on_done=results.append)
     deadline = time.monotonic() + 5
     while results != ["first"] and time.monotonic() < deadline:
-        window.bus.drain()
+        window.drain_all()
     assert results == ["first"]
 
     worker_topics = [t for t, handlers in window.bus._subs.items() if t.startswith("worker/") and handlers]
@@ -336,10 +338,10 @@ def test_indicators_start_disconnected(window) -> None:
 
 def test_serial_indicator_updates_and_announces(window) -> None:
     seen = []
-    window.bus.subscribe("serial/state", seen.append)
+    tab(window).bus.subscribe("serial/state", seen.append)
 
-    window._set_serial_indicator("Serial: connected (COM3)", connected=True)
-    window.bus.drain()
+    tab(window)._set_serial_indicator("Serial: connected (COM3)", connected=True)
+    window.drain_all()
 
     assert "connected (COM3)" in window.serial_label.text()
     assert seen == [{"connected": True, "message": "Serial: connected (COM3)"}]
@@ -347,7 +349,7 @@ def test_serial_indicator_updates_and_announces(window) -> None:
 
 def test_status_topic_reaches_the_status_bar(window) -> None:
     window.bus.post("status", "Auto-connect: probing COM3…")
-    window.bus.drain()
+    window.drain_all()
 
     assert window.statusBar().currentMessage() == "Auto-connect: probing COM3…"
 
@@ -355,7 +357,7 @@ def test_status_topic_reaches_the_status_bar(window) -> None:
 def test_bgr_frame_renders(window) -> None:
     frame = np.zeros((480, 640, 3), np.uint8)
 
-    pixmap = QPixmap.fromImage(window.frame_to_image(frame))
+    pixmap = QPixmap.fromImage(tab(window).frame_to_image(frame))
 
     assert not pixmap.isNull()
     assert (pixmap.width(), pixmap.height()) == (640, 480)
@@ -365,7 +367,7 @@ def test_scaled_frames_never_grow_the_window(qapp, window) -> None:
     # Regression: a scaled pixmap must not feed back into the layout's minimum,
     # or the window ratchets larger on every repaint. Both panels scale — the
     # crop on every classification, the live preview on every frame.
-    window.show_camera_check.setChecked(True)
+    tab(window).show_camera_check.setChecked(True)
     window.resize(1024, 768)
     window.show()
     qapp.processEvents()
@@ -373,10 +375,10 @@ def test_scaled_frames_never_grow_the_window(qapp, window) -> None:
     size_before = window.size()
 
     frame = np.zeros((1080, 1920, 3), np.uint8)
-    window.camera = types.SimpleNamespace(latest_frame=lambda: frame)
+    tab(window).camera = types.SimpleNamespace(latest_frame=lambda: frame)
     for _ in range(3):
-        window._refresh_preview()
-        window._show_crop(frame)
+        tab(window).refresh_preview()
+        tab(window)._show_crop(frame)
         qapp.processEvents()
 
     assert window.minimumSizeHint() == minimum_before

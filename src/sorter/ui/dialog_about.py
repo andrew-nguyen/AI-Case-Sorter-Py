@@ -48,8 +48,9 @@ LICENSE_MISSING_TEXT = (
 
 
 def firmware_line(win: Any) -> str | None:
-    """``None`` unless a broker is actually connected — no line, not a blank one."""
-    broker = getattr(win, "broker", None)
+    """``None`` unless the front sorter tab's board is connected: no line, not a blank one."""
+    tab = getattr(win, "current_tab", None)
+    broker = getattr(tab, "broker", None)
     if broker is None:
         return None
     version = getattr(broker, "firmware_version", None)

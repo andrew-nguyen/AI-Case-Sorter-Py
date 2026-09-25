@@ -19,7 +19,7 @@ from PySide6.QtTest import QTest
 
 from sorter.ui.message_log import MAX_ENTRIES
 
-from .conftest import drain_until
+from .conftest import drain_until, tab
 
 LONG_ERROR = (
     "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: "
@@ -54,8 +54,8 @@ def test_posting_more_than_the_cap_keeps_the_newest(window) -> None:
 
 
 def test_a_run_error_is_kept_in_full(window) -> None:
-    window.bus.post("run/error", LONG_ERROR)
-    window.bus.drain()
+    tab(window).bus.post("run/error", LONG_ERROR)
+    window.drain_all()
 
     entry = window.status_log.entries()[-1]
     assert entry.level == "error"
@@ -65,11 +65,11 @@ def test_a_run_error_is_kept_in_full(window) -> None:
 
 def test_an_error_renders_distinct_from_info(window) -> None:
     window.bus.post("status", "Connected to COM3.")
-    window.bus.drain()
+    window.drain_all()
     info = _last_line_format(window)
 
-    window.bus.post("run/error", "Sort timeout")
-    window.bus.drain()
+    tab(window).bus.post("run/error", "Sort timeout")
+    window.drain_all()
     error = _last_line_format(window)
 
     assert info.foreground().color() == QColor(window.palette_colors["text"])
@@ -79,8 +79,8 @@ def test_an_error_renders_distinct_from_info(window) -> None:
 
 
 def test_a_theme_switch_recolours_the_log(window) -> None:
-    window.bus.post("run/error", "Sort timeout")
-    window.bus.drain()
+    tab(window).bus.post("run/error", "Sort timeout")
+    window.drain_all()
 
     window.set_theme("Light")
 
@@ -92,8 +92,10 @@ def test_a_theme_switch_recolours_the_log(window) -> None:
     [("status/error", "error"), ("test/error", "error"), ("status", "info"), ("run/status", "info")],
 )
 def test_each_status_topic_records_its_level(window, topic, level) -> None:
-    window.bus.post(topic, "something happened")
-    window.bus.drain()
+    # run/* and test/* are a sorter tab's topics; the others reach both buses.
+    bus = tab(window).bus if topic.startswith(("run/", "test/")) else window.bus
+    bus.post(topic, "something happened")
+    window.drain_all()
 
     assert window.status_log.entries()[-1].level == level
 
@@ -101,9 +103,9 @@ def test_each_status_topic_records_its_level(window, topic, level) -> None:
 def test_run_steps_collapse_into_one_line(window) -> None:
     for _case in range(3):
         for step in ("Feeding (slot 1)…", "Capturing & cropping…", "Classifying…"):
-            window.bus.post("run/status", step)
-    window.bus.post("run/error", "Sort timeout")
-    window.bus.drain()
+            tab(window).bus.post("run/status", step)
+    tab(window).bus.post("run/error", "Sort timeout")
+    window.drain_all()
 
     assert [entry.text for entry in window.status_log.entries()][-2:] == ["Classifying…", "Run error: Sort timeout"]
     assert _lines(window)[-2].endswith("Classifying…")
@@ -113,7 +115,7 @@ def test_download_percentages_are_superseded(window) -> None:
     window.bus.post("status/progress", "Downloading m: 10%")
     window.bus.post("status/progress", "Downloading m: 20%")
     window.bus.post("status", "Imported m.")
-    window.bus.drain()
+    window.drain_all()
 
     assert [entry.text for entry in window.status_log.entries()][-1] == "Imported m."
     assert not any("Downloading" in line for line in _lines(window))
@@ -156,8 +158,8 @@ def test_clear_empties_the_panel(window) -> None:
 
 def test_copy_all_copies_every_line(window) -> None:
     window.set_status("Connected to COM3.")
-    window.bus.post("run/error", LONG_ERROR)
-    window.bus.drain()
+    tab(window).bus.post("run/error", LONG_ERROR)
+    window.drain_all()
 
     window.messages_view.copy_button.click()
 
@@ -209,3 +211,16 @@ def test_settled_lines_leave_a_debug_trail(window, caplog) -> None:
     messages = [record.getMessage() for record in caplog.records if record.name == "sorter.ui.app"]
     assert "status [error] Run error: Sort timeout" in messages
     assert not any("Classifying" in message for message in messages)
+
+
+def test_a_background_tab_s_message_is_kept_but_not_shown(window) -> None:
+    """Only the front tab writes the status bar; the panel keeps every tab's lines, named."""
+    window.new_sorter()  # the new tab comes to the front
+    background = tab(window)
+    shown = window.statusBar().currentMessage()
+
+    background.bus.post("status", "Connected to COM3.")
+    window.drain_all()
+
+    assert window.statusBar().currentMessage() == shown
+    assert window.status_log.entries()[-1].text == f"{background.name}: Connected to COM3."

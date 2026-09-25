@@ -151,11 +151,41 @@ class SerialMonitorWidget(QWidget):
             self._apply_font_zoom(self._zoom_percent)
         self.apply_palette()
 
-        win.bus.subscribe("serial/rx", self._on_rx)
-        win.bus.subscribe("serial/tx", self._on_tx)
-        win.bus.subscribe("serial/note", self._on_note)
-        win.bus.subscribe("serial/state", self._on_state)
-        win.bus.subscribe("serial/baud", self._sync_baud_picker)
+        self._subscribe(win.bus)
+
+    def _topics(self) -> tuple[tuple[str, Any], ...]:
+        return (
+            ("serial/rx", self._on_rx),
+            ("serial/tx", self._on_tx),
+            ("serial/note", self._on_note),
+            ("serial/state", self._on_state),
+            ("serial/baud", self._sync_baud_picker),
+        )
+
+    def _subscribe(self, bus: Any) -> None:
+        for topic, handler in self._topics():
+            bus.subscribe(topic, handler)
+
+    def retarget(self, host: Any) -> None:
+        """Follow another sorter tab: its bus, its board, its scrollback.
+
+        The monitor is one dock shared by every tab. Bringing a tab to the
+        front moves the five subscriptions to that tab's bus and replaces the
+        scrollback with the lines the tab kept (``serial_lines``), which it
+        records whether or not the monitor was looking. Lines held by Pause
+        belonged to the previous tab and are dropped with it.
+        """
+        if host is self._win:
+            return
+        for topic, handler in self._topics():
+            self._win.bus.unsubscribe(topic, handler)
+        self._win = host
+        self._subscribe(host.bus)
+        self._lines = deque(getattr(host, "serial_lines", ()), maxlen=MAX_LINES)
+        self._held = deque(maxlen=MAX_LINES)
+        self._rerender()
+        self.refresh_connection()
+        self._sync_baud_picker()
 
     # ----- construction ---------------------------------------------------
 

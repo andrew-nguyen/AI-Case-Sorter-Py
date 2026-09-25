@@ -74,11 +74,11 @@ class CartridgeRepo:
 
 
 class ModelRepo:
-    """CRUD for models, plus active-model selection.
+    """CRUD for models.
 
-    Active-model invariants enforced here:
+    Invariants enforced here:
       - delete refuses to remove the last model of a cartridge
-      - delete refuses to remove the active model unless a replacement is given
+      - delete refuses to remove a model any sorter tab has active
     """
 
     def __init__(self, db: Database) -> None:
@@ -109,22 +109,20 @@ class ModelRepo:
 
         A library can hold more than one row for a UID — earlier versions of
         the app imported every community update as a new model instead of
-        updating the installed one. Resolve that deterministically: the
-        active model wins (it's the one being sorted with), otherwise the
-        oldest, so an update and the Community tab's installed/update badge
+        updating the installed one. Resolve that deterministically: a row some
+        sorter tab has active wins (it's the one being sorted with), otherwise
+        the oldest, so an update and the Community tab's installed/update badge
         always agree on which row they mean.
         """
-        row = self.db.conn.execute(
-            """
-            SELECT m.* FROM models m
-            LEFT JOIN settings s ON s.key = 'default_model_id'
-            WHERE m.community_model_uid = ?
-            ORDER BY (CAST(s.value AS INTEGER) = m.id) DESC, m.id ASC
-            LIMIT 1
-            """,
+        rows = self.db.conn.execute(
+            "SELECT * FROM models WHERE community_model_uid = ? ORDER BY id ASC",
             (uid,),
-        ).fetchone()
-        return Model.from_row(row) if row else None
+        ).fetchall()
+        if not rows:
+            return None
+        active = SettingsRepo(self.db).active_model_ids()
+        row = next((r for r in rows if r["id"] in active), rows[0])
+        return Model.from_row(row)
 
     def count_in_cartridge(self, cartridge_id: int) -> int:
         return self.db.conn.execute(
@@ -226,11 +224,12 @@ class ModelRepo:
             ),
         )
 
-    def delete(self, model_id: int, *, replacement_active_id: int | None = None) -> None:
+    def delete(self, model_id: int) -> None:
         """Delete a model. Refuses when:
 
         - the model is the last one in its cartridge
-        - the model is currently active and no `replacement_active_id` is given
+        - any sorter tab has the model active (that tab would be left
+          classifying with a row that no longer exists)
         """
         existing = self.get(model_id)
         if existing is None:
@@ -238,14 +237,10 @@ class ModelRepo:
         siblings = self.count_in_cartridge(existing.cartridge_id)
         if siblings <= 1:
             raise ValueError("Cannot delete the last model in a cartridge. Add another model first.")
-        settings_repo = SettingsRepo(self.db)
-        if settings_repo.get_active_model_id() == model_id:
-            if replacement_active_id is None:
-                raise ValueError("Cannot delete the active model. Activate another model first.")
-            replacement = self.get(replacement_active_id)
-            if replacement is None or replacement.id == model_id:
-                raise ValueError("Replacement model not found.")
-            settings_repo.set_active_model_id(replacement.id)
+        holders = SettingsRepo(self.db).sorters_with_active_model(model_id)
+        if holders:
+            names = ", ".join(f"“{name}”" for name in holders)
+            raise ValueError(f"Cannot delete a model that is active on {names}. Activate another model there first.")
         self.db.conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
 
 
@@ -433,6 +428,22 @@ class SlotTemplateRepo:
         self.db.conn.execute("DELETE FROM slot_templates WHERE id = ?", (template_id,))
 
 
+# Sorter tabs (see `data/sorters.py`). The roster is an ordered JSON list of
+# `{"id", "name"}` under SORTERS_KEY; everything a tab owns lives under
+# `sorter:<id>:<name>`, so deleting a tab is one prefix delete. Defined here,
+# beside the store, because the model-delete guard has to read them too.
+SORTERS_KEY = "sorters"
+ACTIVE_MODEL_NAME = "active_model_id"
+
+
+def sorter_prefix(sorter_id: int) -> str:
+    return f"sorter:{int(sorter_id)}:"
+
+
+def sorter_key(sorter_id: int, name: str) -> str:
+    return f"{sorter_prefix(sorter_id)}{name}"
+
+
 class SettingsRepo:
     """JSON-encoded key/value store for app-level settings."""
 
@@ -457,16 +468,52 @@ class SettingsRepo:
     def delete(self, key: str) -> None:
         self.db.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
-    # ---- active model helpers ------------------------------------------------
+    def delete_prefix(self, prefix: str) -> None:
+        """Delete every key starting with `prefix` (a tab's whole namespace).
 
-    def get_active_model_id(self) -> int | None:
-        """Returns None when running in AI Config mode (no active local model)."""
-        v = self.get("default_model_id")
-        return int(v) if v is not None else None
+        `substr` rather than LIKE: a prefix is literal, and LIKE would read
+        any `_` or `%` in it as a wildcard.
+        """
+        if not prefix:
+            raise ValueError("delete_prefix needs a non-empty prefix")
+        self.db.conn.execute(
+            "DELETE FROM settings WHERE substr(key, 1, ?) = ?",
+            (len(prefix), prefix),
+        )
 
-    def set_active_model_id(self, model_id: int) -> None:
-        self.set("default_model_id", int(model_id))
+    def items_with_prefix(self, prefix: str) -> builtins.list[tuple[str, Any]]:
+        """Every `(key, value)` whose key starts with `prefix`, ordered by key."""
+        rows = self.db.conn.execute(
+            "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ? ORDER BY key",
+            (len(prefix), prefix),
+        ).fetchall()
+        out: builtins.list[tuple[str, Any]] = []
+        for row in rows:
+            try:
+                out.append((row["key"], json.loads(row["value"])))
+            except (TypeError, ValueError):
+                continue
+        return out
 
-    def clear_active_model(self) -> None:
-        """Switch to AI Config mode by removing the active-model setting."""
-        self.delete("default_model_id")
+    # ---- sorter-tab active models ---------------------------------------------
+
+    def _roster(self) -> builtins.list[dict[str, Any]]:
+        raw = self.get(SORTERS_KEY) or []
+        return [r for r in raw if isinstance(r, dict) and isinstance(r.get("id"), int)]
+
+    def sorters_with_active_model(self, model_id: int) -> builtins.list[str]:
+        """Names of the sorter tabs that have `model_id` active, in tab order."""
+        return [
+            str(r.get("name") or f"Sorter {r['id']}")
+            for r in self._roster()
+            if self.get(sorter_key(r["id"], ACTIVE_MODEL_NAME)) == int(model_id)
+        ]
+
+    def active_model_ids(self) -> builtins.set[int]:
+        """Every model some sorter tab has active."""
+        out: set[int] = set()
+        for r in self._roster():
+            value = self.get(sorter_key(r["id"], ACTIVE_MODEL_NAME))
+            if isinstance(value, int):
+                out.add(value)
+        return out

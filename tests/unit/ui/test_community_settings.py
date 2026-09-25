@@ -2,7 +2,7 @@
 
 Offscreen and networkless: the seams are ``community_page.api_factory`` (a fake
 ``CommunityApi``), the auth object the page reads off the window, and the two
-modal hooks (``window.open_notes_dialog`` / ``window.open_model_update_dialog``).
+modal hooks (``tab(window).open_notes_dialog`` / ``tab(window).open_model_update_dialog``).
 Dialogs are built through the window's own wiring and driven by their button
 handlers — never ``exec()``.
 
@@ -24,13 +24,13 @@ from sorter import paths
 from sorter.community import notes as notes_store
 from sorter.community.community_api import ModelInfo, ModelSettings, ModeratorNote
 from sorter.data.models import Model
-from sorter.data.repository import CartridgeRepo, ModelRepo, SettingsRepo
+from sorter.data.repository import CartridgeRepo, ModelRepo
 from sorter.ml import classifier
-from sorter.ui.app import FEEDBACK_BLOCKED_STATUS, MODEL_UPDATE_BUTTON, NOTES_BUTTON, NOTES_GATE_TITLE
 from sorter.ui.dialog_community_notes import BUTTON_ACKNOWLEDGE, NEW_BADGE, linkify
 from sorter.ui.dialog_model_update import BUTTON_UPDATE, CARRY_OVER, build_model_update_dialog, format_meta
+from sorter.ui.sorter_tab import FEEDBACK_BLOCKED_STATUS, MODEL_UPDATE_BUTTON, NOTES_BUTTON, NOTES_GATE_TITLE
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 UID = "uid-1"
 
@@ -122,7 +122,7 @@ def seed_community_model(
             feedback_loop_confidence_floor=95,
         )
     )
-    SettingsRepo(config.db).set_active_model_id(model.id)
+    config.set_active_model_id(model.id)
     return model
 
 
@@ -132,7 +132,7 @@ def wire(window: Any, api: FakeApi, *, signed_in: bool = True) -> FakeApi:
     window.notify = lambda title, text: window._notices.append((title, text))
     window._notices = []
     window.community_page.api_factory = lambda: api
-    window.open_notes_dialog = lambda: window._notes_opened.append(True)
+    tab(window).open_notes_dialog = lambda: window._notes_opened.append(True)
     window._notes_opened = []
     return api
 
@@ -140,7 +140,7 @@ def wire(window: Any, api: FakeApi, *, signed_in: bool = True) -> FakeApi:
 def enter_sort(window: Any, api: FakeApi) -> None:
     """Navigate to Sort and let the fetch land."""
     window.show_page("Sort")
-    drain_until(window, lambda: not window._settings_fetch_busy)
+    drain_until(window, lambda: not tab(window)._settings_fetch_busy)
 
 
 # ----- the fetch ---------------------------------------------------------------
@@ -186,12 +186,12 @@ def test_a_shared_model_of_our_own_fetches_like_the_wish_list_does(config, windo
 def test_the_server_floor_applies_to_the_run_and_never_to_the_model_row(config, window, monkeypatch) -> None:
     model = seed_community_model(config)
     api = wire(window, FakeApi(settings(confidence_floor=70)))
-    window.broker = object()
-    window._rebuild_run_controller()
+    tab(window).broker = object()
+    tab(window)._rebuild_run_controller()
 
     enter_sort(window, api)
 
-    feedback = window.run_controller._feedback
+    feedback = tab(window).run_controller._feedback
     assert feedback.effective_floor(model) == 70
     stored = ModelRepo(config.db).get(model.id)
     assert stored is not None and stored.feedback_loop_confidence_floor == 95
@@ -200,13 +200,13 @@ def test_the_server_floor_applies_to_the_run_and_never_to_the_model_row(config, 
 def test_a_reconnect_reinstalls_the_server_settings(config, window) -> None:
     model = seed_community_model(config)
     api = wire(window, FakeApi(settings(confidence_floor=70)))
-    window.broker = object()
-    window._rebuild_run_controller()
+    tab(window).broker = object()
+    tab(window)._rebuild_run_controller()
     enter_sort(window, api)
 
-    window._rebuild_run_controller()  # a reconnect builds a fresh FeedbackService
+    tab(window)._rebuild_run_controller()  # a reconnect builds a fresh FeedbackService
 
-    assert window.run_controller._feedback.effective_floor(model) == 70
+    assert tab(window).run_controller._feedback.effective_floor(model) == 70
 
 
 def test_a_blocked_model_says_so_once(config, window) -> None:
@@ -221,29 +221,29 @@ def test_a_blocked_model_says_so_once(config, window) -> None:
 def test_a_failed_fetch_leaves_local_behaviour_alone(config, window) -> None:
     model = seed_community_model(config)
     api = wire(window, FakeApi(settings(confidence_floor=70)))
-    window.broker = object()
-    window._rebuild_run_controller()
+    tab(window).broker = object()
+    tab(window)._rebuild_run_controller()
     enter_sort(window, api)
 
     api.settings = None  # offline
     enter_sort(window, api)
 
-    assert window.run_controller._feedback.effective_floor(model) == 95
+    assert tab(window).run_controller._feedback.effective_floor(model) == 95
     assert window.model_update_button.isHidden()
 
 
 def test_the_wish_list_is_pre_seeded_but_an_empty_one_keeps_the_start_time_list(config, window) -> None:
     model = seed_community_model(config)
     api = wire(window, FakeApi(settings(wish_list=["FC"])))
-    window.broker = object()
-    window._rebuild_run_controller()
+    tab(window).broker = object()
+    tab(window)._rebuild_run_controller()
 
     enter_sort(window, api)
-    assert window.run_controller._feedback.wish_list() == ["fc"]
+    assert tab(window).run_controller._feedback.wish_list() == ["fc"]
 
     api.settings = settings()  # no wish list this time
     enter_sort(window, api)
-    assert window.run_controller._feedback.wish_list() == ["fc"]
+    assert tab(window).run_controller._feedback.wish_list() == ["fc"]
     assert model.id  # (the list is bound to it)
 
 
@@ -299,7 +299,7 @@ def test_update_now_drives_the_community_pages_own_download(config, window) -> N
     window.community_page.start_update = lambda info: updates.append(info)
     enter_sort(window, api)
 
-    dialog = window.model_update_dialog()
+    dialog = tab(window).model_update_dialog()
     dialog.update_button.click()
 
     assert updates == [entry]
@@ -311,7 +311,7 @@ def test_not_now_hides_the_button_until_the_next_entry(config, window) -> None:
     api = wire(window, FakeApi(settings(version=5), models=[info(version=5)]))
     enter_sort(window, api)
 
-    window.model_update_dialog().reject()  # "Not now", and closing, are the same
+    tab(window).model_update_dialog().reject()  # "Not now", and closing, are the same
     assert window.model_update_button.isHidden()
 
     enter_sort(window, api)
@@ -368,7 +368,7 @@ def test_acknowledged_notes_never_re_raise_and_survive_a_restart(qapp, config, w
     enter_sort(window, api)
     qapp.processEvents()
 
-    dialog = window.notes_dialog()
+    dialog = tab(window).notes_dialog()
     assert dialog.list.item(0).text().endswith(NEW_BADGE)
     dialog.acknowledge()
 
@@ -387,7 +387,7 @@ def test_remind_me_later_re_raises_on_the_next_entry(qapp, config, window) -> No
     enter_sort(window, api)
     qapp.processEvents()
 
-    dialog = window.notes_dialog()
+    dialog = tab(window).notes_dialog()
     dialog.reject()  # "Remind me later" / closing changes nothing
 
     enter_sort(window, api)
@@ -400,37 +400,37 @@ def test_start_is_refused_while_a_note_is_unacknowledged(qapp, config, window, m
     seed_community_model(config)
     api = wire(window, FakeApi(settings(notes=[note()])))
     # Everything else about this model is ready to run; only the note isn't.
-    monkeypatch.setattr(classifier, "checkpoint_problem", lambda _db: None)
+    monkeypatch.setattr(classifier, "checkpoint_problem", lambda _db, **_k: None)
     monkeypatch.setattr(window, "ensure_torch", lambda proceed, **kw: True)
-    window.broker = object()
-    window._rebuild_run_controller()
+    tab(window).broker = object()
+    tab(window)._rebuild_run_controller()
     starts: list[int] = []
-    window.run_controller.start = lambda: starts.append(1)
+    tab(window).run_controller.start = lambda: starts.append(1)
     enter_sort(window, api)
     qapp.processEvents()
 
-    window.start_run()
+    tab(window).start_run()
     assert [title for title, _text in window._notices] == [NOTES_GATE_TITLE]
     assert starts == []
 
-    window.notes_dialog().acknowledge()
-    window.start_run()
+    tab(window).notes_dialog().acknowledge()
+    tab(window).start_run()
     assert starts == [1]
 
 
 def test_the_history_button_shows_for_any_notes_acknowledged_or_not(qapp, config, window) -> None:
     seed_community_model(config)
     api = wire(window, FakeApi(settings(notes=[note(), note(2, "Second")])))
-    assert window.notes_button.isHidden()
+    assert tab(window).notes_button.isHidden()
 
     enter_sort(window, api)
     qapp.processEvents()
 
-    assert not window.notes_button.isHidden()
-    assert window.notes_button.text() == NOTES_BUTTON.format(count=2)
+    assert not tab(window).notes_button.isHidden()
+    assert tab(window).notes_button.text() == NOTES_BUTTON.format(count=2)
 
-    window.notes_dialog().acknowledge()
-    assert not window.notes_button.isHidden()  # it is the history view too
+    tab(window).notes_dialog().acknowledge()
+    assert not tab(window).notes_button.isHidden()  # it is the history view too
 
 
 def test_a_note_the_server_stopped_sending_stays_in_the_history(qapp, config, window) -> None:
@@ -438,12 +438,12 @@ def test_a_note_the_server_stopped_sending_stays_in_the_history(qapp, config, wi
     api = wire(window, FakeApi(settings(notes=[note(), note(2, "Second")])))
     enter_sort(window, api)
     qapp.processEvents()
-    window.notes_dialog().acknowledge()
+    tab(window).notes_dialog().acknowledge()
 
     api.settings = settings(notes=[note()])
     enter_sort(window, api)
 
-    assert window.notes_button.text() == NOTES_BUTTON.format(count=2)
+    assert tab(window).notes_button.text() == NOTES_BUTTON.format(count=2)
 
 
 def test_a_url_in_a_note_renders_as_a_clickable_anchor(qapp, config, window) -> None:
@@ -452,7 +452,7 @@ def test_a_url_in_a_note_renders_as_a_clickable_anchor(qapp, config, window) -> 
     enter_sort(window, api)
     qapp.processEvents()
 
-    dialog = window.notes_dialog()
+    dialog = tab(window).notes_dialog()
 
     assert dialog.body.openExternalLinks() is True
     assert '<a href="https://example.invalid/guide">' in dialog.body.toHtml()
@@ -475,8 +475,8 @@ def test_switching_models_drops_the_previous_ones_prompts(qapp, config, window) 
     assert not window.model_update_button.isHidden()
 
     seed_model(config, {"FC": 1}, name="Local")
-    window.bus.post("mode/changed", None)
-    window.bus.drain()
+    tab(window).bus.post("mode/changed", None)
+    window.drain_all()
 
     assert window.model_update_button.isHidden()
-    assert window.notes_button.isHidden()
+    assert tab(window).notes_button.isHidden()

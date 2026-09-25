@@ -19,14 +19,14 @@ pytest.importorskip("PySide6")
 from sorter.data.config import Config
 from sorter.hardware import serial_log
 from sorter.hardware.serial_emulator import EMULATED_PORT, EmulatorBroker
-from sorter.ui import app, settings_serial
+from sorter.ui import settings_serial, sorter_tab
 from sorter.ui.settings_serial import (
     AIRDROP_FIELDS,
     INIT_FIELDS,
     build_serial_section,
 )
 
-from .conftest import drain_until
+from .conftest import drain_until, tab
 
 
 class _Notifier:
@@ -46,21 +46,21 @@ def _select_emulated(section) -> None:
 def _connect_emulated(window, section) -> None:
     _select_emulated(section)
     section.connect_port()
-    assert window.broker is not None
+    assert tab(window).broker is not None
 
 
 # ----- widgets reflect config defaults -----------------------------------------
 
 
 def test_init_fields_reflect_config_defaults(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     for _label, key, _lo, _hi, default in INIT_FIELDS:
         assert section._init_widgets[key].value() == default, key
 
 
 def test_airdrop_fields_reflect_config_defaults(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     assert section.airdrop_enabled_check.isChecked() is False
     for _label, key, _lo, _hi, default in AIRDROP_FIELDS:
@@ -68,7 +68,7 @@ def test_airdrop_fields_reflect_config_defaults(window) -> None:
 
 
 def test_connection_and_sort_arm_fields_reflect_config_defaults(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     assert section.baud_combo.currentText() == "9600"
     assert section.probe_timeout_spin.value() == pytest.approx(4.0)
@@ -82,64 +82,64 @@ def test_connection_and_sort_arm_fields_reflect_config_defaults(window) -> None:
 
 
 def test_editing_an_init_field_persists_and_reads_back(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section._init_widgets["feedspeed"].setValue(123)
 
-    assert window.config.serial["init_settings"]["feedspeed"] == 123
-    assert Config(config.db).load().serial["init_settings"]["feedspeed"] == 123
+    assert tab(window).config.serial["init_settings"]["feedspeed"] == 123
+    assert Config(config.db, sorter_id=1).load().serial["init_settings"]["feedspeed"] == 123
 
 
 def test_editing_an_airdrop_field_persists_and_reads_back(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section._init_widgets["airdroppredelay"].setValue(99)
     section.airdrop_enabled_check.setChecked(True)
 
-    reloaded = Config(config.db).load().serial["init_settings"]
+    reloaded = Config(config.db, sorter_id=1).load().serial["init_settings"]
     assert reloaded["airdroppredelay"] == 99
     assert reloaded["airdropenabled"] == 1
 
 
 def test_editing_sort_steps_persists_into_init_settings(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.sort_steps_spin.setValue(55)
 
-    assert Config(config.db).load().serial["init_settings"]["sortsteps"] == 55
+    assert Config(config.db, sorter_id=1).load().serial["init_settings"]["sortsteps"] == 55
 
 
 def test_editing_slot_count_persists_as_a_direct_serial_key(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.slot_count_spin.setValue(12)
 
-    assert Config(config.db).load().serial["slot_quantity"] == 12
+    assert Config(config.db, sorter_id=1).load().serial["slot_quantity"] == 12
 
 
 def test_editing_probe_timeout_persists(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.probe_timeout_spin.setValue(6.5)
 
-    assert Config(config.db).load().serial["handshake_timeout_s"] == pytest.approx(6.5)
+    assert Config(config.db, sorter_id=1).load().serial["handshake_timeout_s"] == pytest.approx(6.5)
 
 
 def test_toggling_init_on_startup_persists(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.init_on_startup_check.setChecked(True)
 
-    assert Config(config.db).load().serial["init_on_startup"] is True
+    assert Config(config.db, sorter_id=1).load().serial["init_on_startup"] is True
 
 
 def test_sort_to_slot_change_is_not_persisted(window, config) -> None:
     """Transient test control, not a saved setting."""
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.sort_to_spin.setValue(7)
 
-    assert "sort_to" not in Config(config.db).load().serial
+    assert "sort_to" not in Config(config.db, sorter_id=1).load().serial
 
 
 # ----- port ordering -------------------------------------------------------------
@@ -152,7 +152,7 @@ def test_port_combo_pins_emulated_first_then_usb_acm_then_the_rest(window, monke
         lambda: ["/dev/ttyS0", "/dev/ttyUSB0", "/dev/ttyACM0", "COM5"],
     )
 
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     ports = [section.port_combo.itemText(i) for i in range(section.port_combo.count())]
     assert ports == [EMULATED_PORT, "/dev/ttyUSB0", "/dev/ttyACM0", "COM5", "/dev/ttyS0"]
@@ -160,7 +160,7 @@ def test_port_combo_pins_emulated_first_then_usb_acm_then_the_rest(window, monke
 
 def test_refresh_ports_keeps_the_current_selection_if_still_present(window, monkeypatch) -> None:
     monkeypatch.setattr(settings_serial.serial_broker, "list_serial_ports", lambda: ["/dev/ttyUSB0"])
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     section.port_combo.setCurrentText("/dev/ttyUSB0")
 
     monkeypatch.setattr(settings_serial.serial_broker, "list_serial_ports", lambda: ["/dev/ttyUSB1", "/dev/ttyUSB0"])
@@ -173,9 +173,9 @@ def test_refresh_ports_keeps_the_current_selection_if_still_present(window, monk
 
 
 def test_board_only_controls_disabled_without_a_broker(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
-    assert window.broker is None
+    assert tab(window).broker is None
     assert section.connect_button.isEnabled()  # always available — it's how you get a broker
     assert not section.disconnect_button.isEnabled()
     assert not section.get_config_button.isEnabled()
@@ -185,7 +185,7 @@ def test_board_only_controls_disabled_without_a_broker(window) -> None:
 
 
 def test_offline_editable_controls_stay_enabled_without_a_broker(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     assert section.port_combo.isEnabled()
     assert section.baud_combo.isEnabled()
@@ -199,7 +199,7 @@ def test_offline_editable_controls_stay_enabled_without_a_broker(window) -> None
 
 def test_board_only_actions_without_a_broker_notify_instead_of_crashing(window) -> None:
     window.notify = _Notifier()
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.fetch_board_config()
     section.push_to_board()
@@ -210,7 +210,7 @@ def test_board_only_actions_without_a_broker_notify_instead_of_crashing(window) 
 
 
 def test_sort_to_change_without_a_broker_reports_status_not_a_crash(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section._on_sort_to_changed(3)
 
@@ -221,14 +221,14 @@ def test_sort_to_change_without_a_broker_reports_status_not_a_crash(window) -> N
 
 
 def test_connect_to_emulated_port_end_to_end(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     _connect_emulated(window, section)
 
-    assert drain_until(window, lambda: window._serial_state[1] is True)
-    assert isinstance(window.broker, EmulatorBroker)
-    assert window.config.serial["port"] == EMULATED_PORT
-    assert Config(config.db).load().serial["port"] == EMULATED_PORT
+    assert drain_until(window, lambda: tab(window)._serial_state[1] is True)
+    assert isinstance(tab(window).broker, EmulatorBroker)
+    assert tab(window).config.serial["port"] == EMULATED_PORT
+    assert Config(config.db, sorter_id=1).load().serial["port"] == EMULATED_PORT
     assert section.disconnect_button.isEnabled()
     assert section.get_config_button.isEnabled()
     assert section.push_button.isEnabled()
@@ -237,36 +237,36 @@ def test_connect_to_emulated_port_end_to_end(window, config) -> None:
 
 
 def test_disconnect_stops_the_broker_and_returns_to_disconnected(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
     section.disconnect_port()
 
-    assert window.broker is None
-    assert window.run_controller is None
-    assert window._serial_state[1] is False
-    assert "disconnected" in window._serial_state[0].lower()
+    assert tab(window).broker is None
+    assert tab(window).run_controller is None
+    assert tab(window)._serial_state[1] is False
+    assert "disconnected" in tab(window)._serial_state[0].lower()
     assert not section.disconnect_button.isEnabled()
     assert not section.sort_to_spin.isEnabled()
 
 
 def test_connect_with_no_port_selected_reports_status(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     section.port_combo.clear()
 
     section.connect_port()
 
-    assert window.broker is None
-    assert "no port selected" in window._serial_state[0].lower()
+    assert tab(window).broker is None
+    assert "no port selected" in tab(window)._serial_state[0].lower()
 
 
 def test_reactive_to_a_broker_change_made_outside_this_page(window) -> None:
     """E.g. the window's own auto-connect at startup, not this page's Connect."""
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     assert not section.disconnect_button.isEnabled()
 
-    window.broker = object()
-    window._set_serial_indicator("Serial: connected (auto)", connected=True)
+    tab(window).broker = object()
+    tab(window)._set_serial_indicator("Serial: connected (auto)", connected=True)
 
     assert drain_until(window, lambda: section.disconnect_button.isEnabled())
 
@@ -282,7 +282,7 @@ def test_init_on_startup_pushes_settings_after_connect(window, monkeypatch) -> N
         return original(self, settings)
 
     monkeypatch.setattr(EmulatorBroker, "update_init_settings", _spy)
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     section.init_on_startup_check.setChecked(True)
     _select_emulated(section)
 
@@ -296,7 +296,7 @@ def test_init_on_startup_pushes_settings_after_connect(window, monkeypatch) -> N
 
 
 def test_fetch_board_config_applies_matching_keys(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
     section.fetch_board_config()
@@ -310,22 +310,22 @@ def test_fetch_board_config_applies_matching_keys(window) -> None:
 
 
 def test_fetch_board_config_persists_the_applied_values(window, config) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
     section.fetch_board_config()
 
-    assert drain_until(window, lambda: Config(config.db).load().serial["init_settings"]["feedspeed"] == 60)
+    assert drain_until(window, lambda: Config(config.db, sorter_id=1).load().serial["init_settings"]["feedspeed"] == 60)
 
 
 # ----- push to board, against the real emulator ------------------------------------
 
 
 def test_push_to_board_sends_every_init_setting(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
     sent: list[str] = []
-    window.broker.on_sent.append(sent.append)
+    tab(window).broker.on_sent.append(sent.append)
 
     section.push_to_board()
 
@@ -340,10 +340,10 @@ def test_push_to_board_sends_every_init_setting(window) -> None:
 
 
 def test_sort_to_slot_sends_the_sortto_command(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
     sent: list[str] = []
-    window.broker.on_sent.append(sent.append)
+    tab(window).broker.on_sent.append(sent.append)
 
     section.sort_to_spin.setValue(3)
 
@@ -351,11 +351,11 @@ def test_sort_to_slot_sends_the_sortto_command(window) -> None:
 
 
 def test_home_sorter_sends_sortto_zero_and_resets_the_spinbox(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
     section.sort_to_spin.setValue(5)
     sent: list[str] = []
-    window.broker.on_sent.append(sent.append)
+    tab(window).broker.on_sent.append(sent.append)
 
     section._home_sorter()
 
@@ -371,7 +371,7 @@ def test_home_sorter_sends_sortto_zero_and_resets_the_spinbox(window) -> None:
 def test_the_page_opens_the_serial_monitor_dock(window) -> None:
     """A user configuring
     serial is exactly the one who wants to watch the traffic (JL)."""
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     window.serial_dock.toggleView(False)
 
     section.monitor_button.click()
@@ -383,7 +383,7 @@ def test_a_monitor_baud_change_reaches_the_settings_combo(window, config) -> Non
     """Two surfaces show the baud (this page and the monitor's IDE-style
     picker); the config row is the truth and neither may go stale (JL) —
     including while DISCONNECTED, when no serial/state ever fires."""
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     assert section.baud_combo.currentText() == "9600"
 
     # Exactly what the monitor's picker does while disconnected.
@@ -391,7 +391,7 @@ def test_a_monitor_baud_change_reaches_the_settings_combo(window, config) -> Non
     index = monitor.baud_combo.findText("115200")
     monitor.baud_combo.setCurrentIndex(index)
     monitor._on_baud_changed("115200")
-    window.bus.drain()
+    window.drain_all()
 
     assert config.serial["baud"] == 115200
     assert section.baud_combo.currentText() == "115200"
@@ -399,14 +399,14 @@ def test_a_monitor_baud_change_reaches_the_settings_combo(window, config) -> Non
 
 def test_a_settings_baud_change_reaches_the_monitor_picker(window, config) -> None:
     """...and the other direction (JL: 'and vice versa')."""
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     monitor = window.serial_monitor
     assert monitor.baud_combo.currentText() == "9600"
 
     index = section.baud_combo.findText("57600")
     section.baud_combo.setCurrentIndex(index)
     section._on_baud_activated(index)
-    window.bus.drain()
+    window.drain_all()
 
     assert config.serial["baud"] == 57600
     assert monitor.baud_combo.currentText() == "57600"
@@ -416,58 +416,58 @@ def test_a_settings_baud_change_reaches_the_monitor_picker(window, config) -> No
 
 
 def test_a_dropped_link_drops_the_board_and_says_so(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
-    window.broker.simulate_disconnect("cable pulled")
+    tab(window).broker.simulate_disconnect("cable pulled")
 
-    assert drain_until(window, lambda: window.broker is None)
-    assert window.run_controller is None
-    assert window._serial_state[1] is False
-    assert "disconnected" in window._serial_state[0].lower()
+    assert drain_until(window, lambda: tab(window).broker is None)
+    assert tab(window).run_controller is None
+    assert tab(window)._serial_state[1] is False
+    assert "disconnected" in tab(window)._serial_state[0].lower()
     # Recovery is an explicit reconnect, so the page has to offer one.
     assert not section.disconnect_button.isEnabled()
     assert section.connect_button.isEnabled()
 
 
 def test_a_dropped_link_mid_run_stops_it_and_explains(qapp, window, monkeypatch) -> None:
-    monkeypatch.setattr(window, "beep", lambda: None)
+    monkeypatch.setattr(tab(window), "beep", lambda: None)
     notices: list[tuple[str, str]] = []
     window.notify = lambda title, text: notices.append((title, text))
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
-    window._set_running(True)
+    tab(window)._set_running(True)
 
-    window.broker.simulate_disconnect("cable pulled")
+    tab(window).broker.simulate_disconnect("cable pulled")
 
-    assert drain_until(window, lambda: window.broker is None)
+    assert drain_until(window, lambda: tab(window).broker is None)
     qapp.processEvents()  # the dialog is queued out of the drain
-    assert notices and notices[0][0] == app.SERIAL_LOST_TITLE
+    assert notices and notices[0][0] == sorter_tab.SERIAL_LOST_TITLE
     assert "Settings → Serial" in notices[0][1]
 
 
 def test_an_idle_disconnect_does_not_raise_a_dialog(qapp, window, monkeypatch) -> None:
     # Nothing was in motion, and the indicator already carries the news.
-    monkeypatch.setattr(window, "beep", lambda: None)
+    monkeypatch.setattr(tab(window), "beep", lambda: None)
     notices: list[tuple[str, str]] = []
     window.notify = lambda title, text: notices.append((title, text))
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
-    window.broker.simulate_disconnect()
+    tab(window).broker.simulate_disconnect()
 
-    assert drain_until(window, lambda: window.broker is None)
+    assert drain_until(window, lambda: tab(window).broker is None)
     qapp.processEvents()
     assert notices == []
 
 
 def test_the_monitor_records_why_the_link_dropped(window) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
 
-    window.broker.simulate_disconnect("device reports readiness but returned no data")
+    tab(window).broker.simulate_disconnect("device reports readiness but returned no data")
 
-    assert drain_until(window, lambda: window.broker is None)
+    assert drain_until(window, lambda: tab(window).broker is None)
     assert any("device reports readiness" in line for _kind, _stamp, line in window.serial_monitor._lines)
 
 
@@ -479,7 +479,7 @@ def test_macos_usb_adapters_sort_before_the_leftovers(window, monkeypatch) -> No
         lambda: ["/dev/cu.Bluetooth-Incoming-Port", "/dev/cu.usbmodem14201"],
     )
 
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     ports = [section.port_combo.itemText(i) for i in range(section.port_combo.count())]
     assert ports == [EMULATED_PORT, "/dev/cu.usbmodem14201", "/dev/cu.Bluetooth-Incoming-Port"]
@@ -495,25 +495,25 @@ def data_root(tmp_path, monkeypatch):
 
 
 def test_the_traffic_log_is_off_by_default_and_writes_nothing(window, data_root) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     assert not section.log_traffic_check.isChecked()
 
-    window.bus.post("serial/tx", "version")
-    window.bus.post("serial/rx", "ok")
-    window.bus.drain()
+    tab(window).bus.post("serial/tx", "version")
+    tab(window).bus.post("serial/rx", "ok")
+    window.drain_all()
 
     assert serial_log.serial_logs() == []
     assert not (data_root / "logs").exists()
 
 
 def test_switching_the_log_on_records_bus_traffic(window, config, data_root) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
 
     section.log_traffic_check.setChecked(True)
     assert config.serial["log_traffic"] is True
-    window.bus.post("serial/tx", "version")
-    window.bus.post("serial/rx", "CS7.2 Firmware V1.7")
-    window.bus.drain()
+    tab(window).bus.post("serial/tx", "version")
+    tab(window).bus.post("serial/rx", "CS7.2 Firmware V1.7")
+    window.drain_all()
     section.log_traffic_check.setChecked(False)  # flushes
 
     assert config.serial["log_traffic"] is False
@@ -523,22 +523,22 @@ def test_switching_the_log_on_records_bus_traffic(window, config, data_root) -> 
     assert re.search(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} -> version$", text, re.MULTILINE)
     assert re.search(r"^\S+ \S+ <- CS7\.2 Firmware V1\.7$", text, re.MULTILINE)
 
-    window.bus.post("serial/tx", "after off")
-    window.bus.drain()
+    tab(window).bus.post("serial/tx", "after off")
+    window.drain_all()
     assert "after off" not in log_file.read_text(encoding="utf-8")
 
 
 def test_toggling_the_log_leaves_the_connection_alone(window, data_root) -> None:
-    section = build_serial_section(window)
+    section = build_serial_section(tab(window))
     _connect_emulated(window, section)
-    broker = window.broker
+    broker = tab(window).broker
 
     section.log_traffic_check.setChecked(True)
     broker.send_command("getconfig")
     assert drain_until(window, lambda: any(line == "getconfig" for _k, _s, line in window.serial_monitor._lines))
     section.log_traffic_check.setChecked(False)
 
-    assert window.broker is broker
+    assert tab(window).broker is broker
     assert broker.is_connected
     [log_file] = serial_log.serial_logs()
     assert "-> getconfig" in log_file.read_text(encoding="utf-8")
@@ -547,12 +547,12 @@ def test_toggling_the_log_leaves_the_connection_alone(window, data_root) -> None
 def test_the_setting_survives_a_restart_and_a_close_flushes(window_factory, config, data_root) -> None:
     config.serial["log_traffic"] = True
     config.save()
-    window = window_factory(Config(config.db).load())
-    assert build_serial_section(window).log_traffic_check.isChecked()
-    assert window.serial_log.enabled
+    window = window_factory(Config(config.db, sorter_id=1).load())
+    assert build_serial_section(tab(window)).log_traffic_check.isChecked()
+    assert tab(window).serial_log.enabled
 
-    window.bus.post("serial/rx", "ok")
-    window.bus.drain()
+    tab(window).bus.post("serial/rx", "ok")
+    window.drain_all()
     window.close()
 
     [log_file] = serial_log.serial_logs()

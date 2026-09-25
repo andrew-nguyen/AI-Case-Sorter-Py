@@ -1,10 +1,17 @@
-"""SQLite-backed configuration shim.
+"""SQLite-backed configuration for one sorter tab.
 
-Preserves the original `Config` public surface (`config.api`, `config.serial`,
-`config.image_proc`, `config.camera`, `config.headstamps`, `config.save()`)
-so the existing tab code does not need to change. App-level settings live in
-the `settings` table; headstamps live in their own table and are scoped to
-the currently active model.
+`Config` is constructed for a sorter tab (`Config(db, sorter_id=...)`, see
+`data/sorters.py`). The tab's serial, camera and image-processing sections,
+its active model, its run options, its live slot layouts and its
+active-template pointers are stored under that tab's `sorter:<id>:` settings
+namespace. The AI server section (`config.api`), headstamp and parent rows,
+and sorting-template definitions are shared by every tab.
+
+Slot assignments have two layers. The `headstamps.slot` /
+`headstamp_parents.slot` columns and `package_slots:<model|ai>` hold a
+model's *default* layout. Each tab copies that default into its own live
+layout the first time it reads a model, and routes from its own copy after
+that, so two machines can run the same model with different bins.
 
 The DEFAULTS structure stays here as the canonical fallback when no settings
 row exists yet.
@@ -13,16 +20,20 @@ row exists yet.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from .db import Database
 from .models import SLOT_TEMPLATE_MODES, SlotTemplate
 from .repository import (
+    ACTIVE_MODEL_NAME,
     HeadstampParentRepo,
     HeadstampRepo,
     SettingsRepo,
     SlotTemplateRepo,
+    sorter_key,
 )
+from .sorters import SORTER_SCOPED_SECTIONS
 
 DEFAULT_INIT_SETTINGS: dict[str, int | str] = {
     "feedhomingoffset": 0,
@@ -93,16 +104,19 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
-_SECTIONS = ("api", "serial", "image_proc", "camera")
+# The shared AI server settings are app-level; everything else Config caches
+# belongs to the sorter tab it was built for (see `data/sorters.py`).
+_API_SECTION = "api"
 # AI Config mode (no active model) keeps its own headstamp list. The DB
 # `headstamps` table requires a real model_id FK, so we stash AI Config
 # headstamps in the key/value settings table instead.
 _AI_HEADSTAMPS_KEY = "ai_config_headstamps"
-# Per-model runtime toggle for parent-classification routing. Keyed by model
-# id (``use_parent_runtime:<id>``); a per-installation preference, not exported.
+# Parent-classification routing toggle. The model-level key
+# (``use_parent_runtime:<model id>``) is the model's default, written by the
+# WinForms import; a tab's own copy lives in its namespace and is what routes.
 _USE_PARENT_RUNTIME_KEY = "use_parent_runtime"
 
-# App-level run options.
+# Run options, stored per tab under these names.
 _RUN_CONFIDENCE_FLOOR_KEY = "run_confidence_floor"
 _RUN_STORE_IMAGES_KEY = "run_store_images"
 # Valid "store images" modes (internal value -> meaning):
@@ -120,6 +134,8 @@ DEFAULT_CONFIDENCE_FLOOR = 30
 # headstamp can live in multiple bins at once.
 _RUN_PACKAGE_MODE_KEY = "run_package_mode"
 _RUN_PACKAGE_SIZE_KEY = "run_package_size"
+# `package_slots:<model id|ai>` is a model's *default* package layout (what a
+# WinForms import writes and a tab seeds from), not the live one.
 _PACKAGE_SLOTS_KEY = "package_slots"
 DEFAULT_PACKAGE_SIZE = 50
 
@@ -127,14 +143,20 @@ DEFAULT_PACKAGE_SIZE = 50
 # any slot is auto-routed to the first empty slot.
 _RUN_AUTO_SELECT_KEY = "run_auto_select_trays"
 
-# Sorting templates: named layouts of the Run tab's slot assignments, so one
-# model can carry several bin arrangements. The live assignments (the
-# `headstamps`/`headstamp_parents` slot columns and the package slot map) stay
-# the single source of truth a run reads; the *active* template is kept in
-# lock-step with them (see `sync_active_slot_template`) so switching templates
-# is a straight save-current / load-next swap. Templates are per model AND per
-# run mode — package mode's many-to-many assignments are a different shape.
-# Key: `active_slot_template:<model id|ai>:<mode>` -> template row id.
+# Live slot layouts. Each tab keeps its own, per model and per run mode, under
+# `sorter:<id>:slots:<model id|ai>:<mode>`, in exactly the payload shape a
+# sorting template stores. The `headstamps.slot` / `headstamp_parents.slot`
+# columns and `package_slots:<model|ai>` are the model's *default* layout: a
+# tab copies them into its own layout the first time it reads that scope, and
+# after that they no longer move the tab.
+_LIVE_SLOTS_KEY = "slots"
+
+# Sorting templates: named layouts, shared per model AND per run mode —
+# package mode's many-to-many assignments are a different shape. The *active*
+# template is per tab and kept in lock-step with that tab's live layout (see
+# `sync_active_slot_template`), so switching templates is a straight
+# save-current / load-next swap.
+# Key: `sorter:<id>:active_slot_template:<model id|ai>:<mode>` -> template id.
 _ACTIVE_TEMPLATE_KEY = "active_slot_template"
 DEFAULT_SLOT_TEMPLATE_NAME = "Default"
 
@@ -156,67 +178,173 @@ def _merge_defaults(defaults: Any, loaded: Any) -> Any:
     return loaded if loaded is not None else defaults
 
 
+def _positive_slot_map(raw: Any) -> dict[str, int]:
+    """`{name: slot}` with every slot a positive int; anything else dropped."""
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, slot in raw.items():
+        try:
+            value = int(slot)
+        except (TypeError, ValueError):
+            continue
+        if name and value > 0:
+            out[str(name)] = value
+    return out
+
+
+def _package_slot_lists(raw: Any) -> dict[str, list[str]]:
+    """`{slot: [names]}` with every slot key a positive int string."""
+    out: dict[str, list[str]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, names in raw.items():
+        try:
+            slot = int(key)
+        except (TypeError, ValueError):
+            continue
+        if slot <= 0:
+            continue
+        out[str(slot)] = [str(n) for n in (names or []) if n]
+    return out
+
+
+_LIVE_KEY_RE = re.compile(r"^sorter:\d+:slots:(?P<scope>[^:]+):(?P<mode>[^:]+)$")
+
+
+def rename_in_live_layouts(db: Database, model_id: int | None, old: str, new: str, *, parent: bool = False) -> None:
+    """Carry a headstamp (or parent) rename into every sorter tab's live layout.
+
+    A tab's live layout is keyed by name so that it survives a headstamp being
+    deleted and re-added. The cost is that a rename, which keeps the row and
+    its slot column, would otherwise leave every tab's copy pointing at a name
+    that no longer exists, and that tab would silently drop the case into the
+    catch-all. `model_id` None is AI Config mode's headstamp list.
+    """
+    if not old or not new or old == new:
+        return
+    settings = SettingsRepo(db)
+    scope = str(model_id) if model_id is not None else "ai"
+    with db.transaction():
+        for key, payload in settings.items_with_prefix("sorter:"):
+            match = _LIVE_KEY_RE.match(key)
+            if match is None or match["scope"] != scope or not isinstance(payload, dict):
+                continue
+            changed = False
+            if match["mode"] == "package":
+                if parent:
+                    continue
+                slots = _package_slot_lists(payload.get("slots"))
+                for slot, names in slots.items():
+                    if old in names:
+                        slots[slot] = [new if n == old else n for n in names]
+                        changed = True
+                payload = {"slots": slots}
+            else:
+                section = "parents" if parent else "headstamps"
+                mapping = _positive_slot_map(payload.get(section))
+                if old in mapping:
+                    mapping[new] = mapping.pop(old)
+                    payload = {**payload, section: mapping}
+                    changed = True
+            if changed:
+                settings.set(key, payload)
+
+
 class Config:
-    """In-memory mirror of the persisted app settings.
+    """One sorter tab's view of the persisted settings.
+
+    Every `Config` belongs to exactly one sorter tab (`sorter_id`, required):
+    its serial, camera and image-processing sections, active model, run
+    options, live slot layouts and active-template pointers are that tab's.
+    The AI server section (`api`), headstamp rows, parent rows and template
+    definitions are shared across tabs.
 
     Headstamps live in their own SQLite table (managed by HeadstampRepo) and
     are read fresh on every access — they are NOT part of the cached
     settings snapshot, because they get mutated through several call paths
     (Models tab editor, Train tab Save, Community import) and caching a
     stale snapshot here used to silently wipe rows whenever any other tab
-    happened to call ``config.save()``.
+    happened to call ``config.save()``. The shared `api` section is not
+    cached either, for the same reason: another tab's `Config` may change it
+    at any time, so `api` hands back a fresh copy and `save_api()` writes
+    exactly the values it is given.
     """
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, sorter_id: int) -> None:
         self.db = db
+        self.sorter_id = int(sorter_id)
         self.settings = SettingsRepo(db)
         self.headstamps_repo = HeadstampRepo(db)
         self.parents_repo = HeadstampParentRepo(db)
         self.templates_repo = SlotTemplateRepo(db)
-        self.data: dict[str, Any] = copy.deepcopy(DEFAULTS)
+        self.data: dict[str, Any] = {s: copy.deepcopy(DEFAULTS[s]) for s in SORTER_SCOPED_SECTIONS}
+
+    def _key(self, name: str) -> str:
+        return sorter_key(self.sorter_id, name)
 
     def load(self) -> Config:
-        for key in _SECTIONS:
-            stored = self.settings.get(key)
-            if stored is not None:
-                self.data[key] = _merge_defaults(copy.deepcopy(DEFAULTS[key]), stored)
-            else:
-                self.data[key] = copy.deepcopy(DEFAULTS[key])
+        for section in SORTER_SCOPED_SECTIONS:
+            self.data[section] = self._merged(self.settings.get(self._key(section)), section)
         return self
 
-    def reload_headstamps_for_active_model(self) -> None:
-        """No-op kept for callers (`tab_models._activate`).
-
-        Headstamps are now always read fresh from the DB so there is no
-        cached copy to invalidate. The method stays so existing call sites
-        don't need to change.
-        """
-        return
+    @staticmethod
+    def _merged(stored: Any, section: str) -> dict[str, Any]:
+        if stored is None:
+            return copy.deepcopy(DEFAULTS[section])
+        return _merge_defaults(copy.deepcopy(DEFAULTS[section]), stored)
 
     def save(self) -> None:
-        """Persist the cached settings sections. Does NOT touch headstamps."""
+        """Persist this tab's cached sections. Touches neither headstamps nor `api`."""
         with self.db.transaction() as _:
-            for key in _SECTIONS:
-                self.settings.set(key, self.data[key])
+            for section in SORTER_SCOPED_SECTIONS:
+                self.settings.set(self._key(section), self.data[section])
 
-    # --- public surface (matches old JSON Config) ---------------------------
+    def save_api(self, values: dict[str, Any]) -> None:
+        """Persist `values` as the shared AI server section (every tab sees it)."""
+        self.settings.set(_API_SECTION, self._merged(values, _API_SECTION))
+
+    # --- public surface -----------------------------------------------------
 
     @property
     def api(self) -> dict[str, Any]:
-        return self.data["api"]
+        """A fresh copy of the shared AI server settings.
+
+        Editing the returned dict changes nothing until it is passed to
+        `save_api()`.
+        """
+        return self._merged(self.settings.get(_API_SECTION), _API_SECTION)
+
+    # ----- active model (per tab) -------------------------------------------
+
+    @property
+    def active_model_id(self) -> int | None:
+        """This tab's active model, or None for AI Config mode. Read fresh."""
+        value = self.settings.get(self._key(ACTIVE_MODEL_NAME))
+        return value if isinstance(value, int) else None
+
+    def set_active_model_id(self, model_id: int | None) -> None:
+        """Activate `model_id` on this tab, or AI Config mode for None."""
+        if model_id is None:
+            self.settings.delete(self._key(ACTIVE_MODEL_NAME))
+        else:
+            self.settings.set(self._key(ACTIVE_MODEL_NAME), int(model_id))
 
     @property
     def headstamps(self) -> list[dict[str, Any]]:
-        """Always returns a freshly-read list of headstamps for the active model.
+        """The active context's headstamps with this tab's live slots. Read fresh.
 
-        In AI Config mode (no active local model) headstamps live in a
-        settings entry instead of the model-scoped headstamps table.
+        In AI Config mode (no active model) headstamps live in a settings
+        entry instead of the model-scoped headstamps table.
         """
-        active_id = self.settings.get_active_model_id()
-        if active_id is None:
-            return list(self._read_ai_headstamps())
-        rows = self.headstamps_repo.list_for_model(active_id)
-        return [{"name": r.name, "slot": r.slot} for r in rows]
+        names = self._headstamp_names(self.active_model_id)
+        slots = self._live_standard()["headstamps"]
+        return [{"name": name, "slot": int(slots.get(name, 0))} for name in names]
+
+    def _headstamp_names(self, model_id: int | None) -> list[str]:
+        if model_id is None:
+            return [e["name"] for e in self._read_ai_headstamps()]
+        return [h.name for h in self.headstamps_repo.list_for_model(model_id)]
 
     # ----- AI Config-mode headstamp storage ---------------------------------
 
@@ -233,89 +361,131 @@ class Config:
     def _write_ai_headstamps(self, entries: list[dict[str, Any]]) -> None:
         self.settings.set(_AI_HEADSTAMPS_KEY, entries)
 
-    # ----- headstamp mutations (write straight through to the repo) ---------
+    # ----- live slot layouts (per tab) --------------------------------------
+
+    @staticmethod
+    def _scope(model_id: int | None) -> str:
+        return str(model_id) if model_id is not None else "ai"
+
+    def _live_key(self, model_id: int | None, mode: str) -> str:
+        return self._key(f"{_LIVE_SLOTS_KEY}:{self._scope(model_id)}:{mode}")
+
+    def _default_layout(self, model_id: int | None, mode: str) -> dict[str, Any]:
+        """The model's stored default layout, in template-payload shape."""
+        if mode == "package":
+            raw = self.settings.get(f"{_PACKAGE_SLOTS_KEY}:{self._scope(model_id)}")
+            return {"slots": _package_slot_lists(raw)}
+        if model_id is None:
+            return {
+                "headstamps": {e["name"]: int(e["slot"]) for e in self._read_ai_headstamps() if int(e["slot"]) > 0},
+                "parents": {},
+            }
+        return {
+            "headstamps": {
+                h.name: int(h.slot) for h in self.headstamps_repo.list_for_model(model_id) if int(h.slot) > 0
+            },
+            "parents": {p.name: int(p.slot) for p in self.parents_repo.list_for_model(model_id) if int(p.slot) > 0},
+        }
+
+    def _live(self, model_id: int | None, mode: str) -> dict[str, Any]:
+        """This tab's live layout for `(model_id, mode)`, seeded on first read.
+
+        The seed is persisted immediately, so from then on the model's default
+        layout (the slot columns) no longer moves this tab.
+        """
+        key = self._live_key(model_id, mode)
+        with self.db.transaction():
+            stored = self.settings.get(key)
+            if not isinstance(stored, dict):
+                stored = self._default_layout(model_id, mode)
+                self.settings.set(key, stored)
+        if mode == "package":
+            return {"slots": _package_slot_lists(stored.get("slots"))}
+        return {
+            "headstamps": _positive_slot_map(stored.get("headstamps")),
+            "parents": _positive_slot_map(stored.get("parents")),
+        }
+
+    def _write_live(self, model_id: int | None, mode: str, payload: dict[str, Any]) -> None:
+        self.settings.set(self._live_key(model_id, mode), payload)
+
+    def _live_standard(self) -> dict[str, Any]:
+        return self._live(self.active_model_id, "standard")
+
+    # ----- headstamp mutations ----------------------------------------------
 
     def add_headstamp(self, name: str, slot: int = 0) -> bool:
         """Add a headstamp for the active context. Returns False if `name`
-        is empty or already present.
+        is empty or already present. A positive `slot` is recorded both as the
+        model's default and in this tab's live layout.
         """
         if not name:
             return False
-        active_id = self.settings.get_active_model_id()
+        active_id = self.active_model_id
         if active_id is None:
             current = self._read_ai_headstamps()
             if any(e["name"] == name for e in current):
                 return False
             current.append({"name": name, "slot": int(slot)})
             self._write_ai_headstamps(current)
-            if int(slot) > 0:
-                self.sync_active_slot_template("standard")
-            return True
-        existing = {h.name for h in self.headstamps_repo.list_for_model(active_id)}
-        if name in existing:
-            return False
-        try:
-            self.headstamps_repo.add(active_id, name, slot)
-        except Exception:
-            return False
+        else:
+            existing = {h.name for h in self.headstamps_repo.list_for_model(active_id)}
+            if name in existing:
+                return False
+            try:
+                self.headstamps_repo.add(active_id, name, slot)
+            except Exception:
+                return False
         if int(slot) > 0:
-            self.sync_active_slot_template("standard")
+            self.set_headstamp_slot(name, int(slot))
         return True
 
     def remove_headstamp(self, name: str) -> bool:
-        active_id = self.settings.get_active_model_id()
+        active_id = self.active_model_id
         if active_id is None:
             current = self._read_ai_headstamps()
             remaining = [e for e in current if e["name"] != name]
             if len(remaining) == len(current):
                 return False
             self._write_ai_headstamps(remaining)
-            return True
-        for h in self.headstamps_repo.list_for_model(active_id):
-            if h.name == name:
-                self.headstamps_repo.delete(h.id)
-                return True
-        return False
+        else:
+            match = next((h for h in self.headstamps_repo.list_for_model(active_id) if h.name == name), None)
+            if match is None:
+                return False
+            self.headstamps_repo.delete(match.id)
+        live = self._live_standard()
+        if live["headstamps"].pop(name, None) is not None:
+            self._write_live(active_id, "standard", live)
+        return True
 
     def clear_headstamps(self) -> None:
-        active_id = self.settings.get_active_model_id()
+        active_id = self.active_model_id
         if active_id is None:
             self._write_ai_headstamps([])
-            return
-        self.headstamps_repo.clear_for_model(active_id)
-
-    def set_headstamps(self, entries: list[dict[str, Any]]) -> None:
-        """Replace all headstamps for the active context (model or AI Config)."""
-        active_id = self.settings.get_active_model_id()
-        if active_id is None:
-            normalised = [{"name": str(e["name"]), "slot": int(e.get("slot", 0))} for e in entries if e.get("name")]
-            self._write_ai_headstamps(normalised)
-            return
-        self.headstamps_repo.replace_for_model(active_id, entries)
+        else:
+            self.headstamps_repo.clear_for_model(active_id)
+        live = self._live_standard()
+        live["headstamps"] = {}
+        self._write_live(active_id, "standard", live)
 
     def set_headstamp_slot(self, name: str, slot: int) -> bool:
-        """Update the slot assignment for a single headstamp. Returns False if
-        the headstamp doesn't exist for the active context. Used by the Run
-        tab's slot-details checkboxes — those used to mutate the dicts
-        returned by ``config.headstamps`` directly, but that's a no-op now
-        that the property reads fresh on every access.
+        """Assign a headstamp of the active context to a slot on this tab.
+
+        Returns False if the headstamp doesn't exist for the active context.
+        Writes this tab's live layout only — the model's default layout and
+        every other tab are untouched.
         """
-        active_id = self.settings.get_active_model_id()
-        if active_id is None:
-            current = self._read_ai_headstamps()
-            for entry in current:
-                if entry["name"] == name:
-                    entry["slot"] = int(slot)
-                    self._write_ai_headstamps(current)
-                    self.sync_active_slot_template("standard")
-                    return True
+        active_id = self.active_model_id
+        if name not in self._headstamp_names(active_id):
             return False
-        for h in self.headstamps_repo.list_for_model(active_id):
-            if h.name == name:
-                self.headstamps_repo.update_slot(h.id, int(slot))
-                self.sync_active_slot_template("standard")
-                return True
-        return False
+        live = self._live_standard()
+        if int(slot) > 0:
+            live["headstamps"][name] = int(slot)
+        else:
+            live["headstamps"].pop(name, None)
+        self._write_live(active_id, "standard", live)
+        self.sync_active_slot_template("standard")
+        return True
 
     @property
     def serial(self) -> dict[str, Any]:
@@ -330,14 +500,15 @@ class Config:
         return self.data["camera"]
 
     def slot_for_headstamp(self, name: str) -> int | None:
-        """Resolve the physical bin for a classified label.
+        """Resolve the physical bin for a classified label on this tab.
 
         In parent-classification mode a child label routes to *its parent's*
         slot, while an orphan (parentless) headstamp routes to its own slot.
         Otherwise routing is the standard per-headstamp lookup. Returns None
         when the label maps to nothing (caller falls back to catch-all).
         """
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
+        live = self._live_standard()
         if mid is not None and self.use_parent_classifications:
             parents = {p.id: p for p in self.parents_repo.list_for_model(mid)}
             if parents:
@@ -345,15 +516,14 @@ class Config:
                 hs = next((h for h in headstamps if h.name == name), None)
                 if hs is not None:
                     if hs.parent_id is not None and hs.parent_id in parents:
-                        return int(parents[hs.parent_id].slot)
-                    return int(hs.slot)
+                        return int(live["parents"].get(parents[hs.parent_id].name, 0))
+                    return int(live["headstamps"].get(hs.name, 0))
                 # The label may already be a parent name (parent-trained model).
                 parent = next((p for p in parents.values() if p.name == name), None)
-                return int(parent.slot) if parent is not None else None
+                return int(live["parents"].get(parent.name, 0)) if parent is not None else None
 
-        for entry in self.headstamps:
-            if entry.get("name") == name:
-                return int(entry.get("slot", 0))
+        if name in self._headstamp_names(mid):
+            return int(live["headstamps"].get(name, 0))
         return None
 
     # ----- parent classifications --------------------------------------------
@@ -364,52 +534,72 @@ class Config:
         Drives whether the "Use Parent Classifications" run option is shown.
         Always False in AI Config mode (those headstamps have no parents).
         """
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         if mid is None:
             return False
         return bool(self.parents_repo.list_for_model(mid))
 
     @property
     def use_parent_classifications(self) -> bool:
-        """Per-model runtime preference. False in AI Config mode."""
-        mid = self.settings.get_active_model_id()
+        """This tab's parent-routing toggle for its active model.
+
+        Falls back to the model's default (the model-level key) until the tab
+        sets its own. False in AI Config mode.
+        """
+        mid = self.active_model_id
         if mid is None:
             return False
+        own = self.settings.get(self._key(f"{_USE_PARENT_RUNTIME_KEY}:{mid}"))
+        if own is not None:
+            return bool(own)
         return bool(self.settings.get(f"{_USE_PARENT_RUNTIME_KEY}:{mid}", False))
 
     def set_use_parent_classifications(self, value: bool) -> bool:
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         if mid is None:
             return False
-        self.settings.set(f"{_USE_PARENT_RUNTIME_KEY}:{mid}", bool(value))
+        self.settings.set(self._key(f"{_USE_PARENT_RUNTIME_KEY}:{mid}"), bool(value))
         return True
 
     def parents_with_slots(self) -> list[dict[str, Any]]:
         """[{id, name, slot}] for the active model's parents (empty in AI mode)."""
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         if mid is None:
             return []
-        return [{"id": p.id, "name": p.name, "slot": int(p.slot)} for p in self.parents_repo.list_for_model(mid)]
+        slots = self._live_standard()["parents"]
+        return [
+            {"id": p.id, "name": p.name, "slot": int(slots.get(p.name, 0))}
+            for p in self.parents_repo.list_for_model(mid)
+        ]
 
     def headstamps_with_parents(self) -> list[dict[str, Any]]:
         """[{name, slot, parent_id}] for the active model (parent_id None in AI mode)."""
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
+        slots = self._live_standard()["headstamps"]
         if mid is None:
             return [
-                {"name": e["name"], "slot": int(e.get("slot", 0)), "parent_id": None}
+                {"name": e["name"], "slot": int(slots.get(e["name"], 0)), "parent_id": None}
                 for e in self._read_ai_headstamps()
             ]
         return [
-            {"name": h.name, "slot": int(h.slot), "parent_id": h.parent_id}
+            {"name": h.name, "slot": int(slots.get(h.name, 0)), "parent_id": h.parent_id}
             for h in self.headstamps_repo.list_for_model(mid)
         ]
 
     def set_parent_slot(self, parent_id: int, slot: int) -> bool:
-        """Assign a parent classification to a physical slot. Local models only."""
-        mid = self.settings.get_active_model_id()
+        """Assign a parent classification to a slot on this tab. Local models only."""
+        mid = self.active_model_id
         if mid is None:
             return False
-        self.parents_repo.update_slot(int(parent_id), int(slot))
+        parent = self.parents_repo.get(int(parent_id))
+        if parent is None or parent.model_id != mid:
+            return False
+        live = self._live_standard()
+        if int(slot) > 0:
+            live["parents"][parent.name] = int(slot)
+        else:
+            live["parents"].pop(parent.name, None)
+        self._write_live(mid, "standard", live)
         self.sync_active_slot_template("standard")
         return True
 
@@ -420,7 +610,7 @@ class Config:
         for unknown labels. Independent of the runtime toggle — callers decide
         whether to surface it.
         """
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         if mid is None:
             return None
         hs = next(
@@ -432,7 +622,7 @@ class Config:
         parent = self.parents_repo.get(hs.parent_id)
         return parent.name if parent else None
 
-    # ----- run options (app-level) -------------------------------------------
+    # ----- run options (per tab) ---------------------------------------------
 
     @property
     def run_confidence_floor(self) -> int:
@@ -441,36 +631,36 @@ class Config:
         Predictions below this route to slot 0. 0 disables the floor.
         """
         try:
-            return int(self.settings.get(_RUN_CONFIDENCE_FLOOR_KEY, DEFAULT_CONFIDENCE_FLOOR))
+            return int(self.settings.get(self._key(_RUN_CONFIDENCE_FLOOR_KEY), DEFAULT_CONFIDENCE_FLOOR))
         except (TypeError, ValueError):
             return DEFAULT_CONFIDENCE_FLOOR
 
     def set_run_confidence_floor(self, value: int) -> None:
-        self.settings.set(_RUN_CONFIDENCE_FLOOR_KEY, max(0, min(100, int(value))))
+        self.settings.set(self._key(_RUN_CONFIDENCE_FLOOR_KEY), max(0, min(100, int(value))))
 
     @property
     def run_store_images(self) -> str:
         """One of STORE_IMAGES_MODES; controls run-image capture."""
-        value = self.settings.get(_RUN_STORE_IMAGES_KEY, "none")
+        value = self.settings.get(self._key(_RUN_STORE_IMAGES_KEY), "none")
         return value if value in STORE_IMAGES_MODES else "none"
 
     def set_run_store_images(self, mode: str) -> None:
         if mode in STORE_IMAGES_MODES:
-            self.settings.set(_RUN_STORE_IMAGES_KEY, mode)
+            self.settings.set(self._key(_RUN_STORE_IMAGES_KEY), mode)
 
     # ----- package mode (batch sorting) --------------------------------------
 
     @property
     def run_package_mode(self) -> bool:
-        return bool(self.settings.get(_RUN_PACKAGE_MODE_KEY, False))
+        return bool(self.settings.get(self._key(_RUN_PACKAGE_MODE_KEY), False))
 
     def set_run_package_mode(self, value: bool) -> None:
-        self.settings.set(_RUN_PACKAGE_MODE_KEY, bool(value))
+        self.settings.set(self._key(_RUN_PACKAGE_MODE_KEY), bool(value))
 
     @property
     def run_package_size(self) -> int:
         try:
-            value = int(self.settings.get(_RUN_PACKAGE_SIZE_KEY, DEFAULT_PACKAGE_SIZE))
+            value = int(self.settings.get(self._key(_RUN_PACKAGE_SIZE_KEY), DEFAULT_PACKAGE_SIZE))
         except (TypeError, ValueError):
             value = DEFAULT_PACKAGE_SIZE
         return value if value > 0 else DEFAULT_PACKAGE_SIZE
@@ -480,29 +670,12 @@ class Config:
             value = int(value)
         except (TypeError, ValueError):
             return
-        self.settings.set(_RUN_PACKAGE_SIZE_KEY, max(1, value))
-
-    def _package_slots_key(self) -> str:
-        """Settings key for the active context's package slot assignments.
-
-        Package assignments are model-scoped (each model has its own bins),
-        with a single shared bucket for AI Config mode where there is no model.
-        """
-        mid = self.settings.get_active_model_id()
-        return f"{_PACKAGE_SLOTS_KEY}:{mid if mid is not None else 'ai'}"
+        self.settings.set(self._key(_RUN_PACKAGE_SIZE_KEY), max(1, value))
 
     def package_slot_map(self) -> dict[int, list[str]]:
-        """slot -> [headstamp names] for the active context's package config."""
-        raw = self.settings.get(self._package_slots_key()) or {}
-        out: dict[int, list[str]] = {}
-        if isinstance(raw, dict):
-            for k, names in raw.items():
-                try:
-                    slot = int(k)
-                except (TypeError, ValueError):
-                    continue
-                out[slot] = [str(n) for n in (names or []) if n]
-        return out
+        """slot -> [headstamp names] for this tab's package layout."""
+        slots = self._live(self.active_model_id, "package")["slots"]
+        return {int(k): list(v) for k, v in slots.items()}
 
     def headstamps_in_package_slot(self, slot: int) -> list[str]:
         return list(self.package_slot_map().get(int(slot), []))
@@ -519,18 +692,17 @@ class Config:
         """
         if int(slot) <= 0 or not name:
             return
-        raw = self.settings.get(self._package_slots_key()) or {}
-        if not isinstance(raw, dict):
-            raw = {}
+        mid = self.active_model_id
+        live = self._live(mid, "package")
         key = str(int(slot))
-        names = [str(n) for n in (raw.get(key) or []) if n]
+        names = list(live["slots"].get(key, []))
         if enabled:
             if name not in names:
                 names.append(name)
         else:
             names = [n for n in names if n != name]
-        raw[key] = names
-        self.settings.set(self._package_slots_key(), raw)
+        live["slots"][key] = names
+        self._write_live(mid, "package", live)
         self.sync_active_slot_template("package")
 
     # ----- sorting templates --------------------------------------------------
@@ -539,12 +711,9 @@ class Config:
         """Which template list applies right now: 'package' or 'standard'."""
         return "package" if self.run_package_mode else "standard"
 
-    @staticmethod
-    def _template_key_for(model_id: int | None, mode: str) -> str:
-        return f"{_ACTIVE_TEMPLATE_KEY}:{model_id if model_id is not None else 'ai'}:{mode}"
-
-    def _active_template_key(self, mode: str) -> str:
-        return self._template_key_for(self.settings.get_active_model_id(), mode)
+    def _active_template_key(self, mode: str, model_id: int | None = None) -> str:
+        scope = self._scope(self.active_model_id if model_id is None else model_id)
+        return self._key(f"{_ACTIVE_TEMPLATE_KEY}:{scope}:{mode}")
 
     def _resolve_template_mode(self, mode: str | None) -> str:
         if mode is None:
@@ -554,23 +723,22 @@ class Config:
         return mode
 
     def capture_slot_assignments(self, mode: str | None = None) -> dict[str, Any]:
-        """Snapshot the live slot assignments for `mode` into a template payload.
+        """Snapshot this tab's live assignments for `mode` into a template payload.
 
         Only non-catch-all assignments are stored; anything not mentioned is
-        restored to slot 0 (unassigned) when the payload is applied.
+        restored to slot 0 (unassigned) when the payload is applied. Standard
+        mode keeps only names the active context still has.
         """
         mode = self._resolve_template_mode(mode)
+        mid = self.active_model_id
+        live = self._live(mid, mode)
         if mode == "package":
-            return {
-                "slots": {
-                    str(int(slot)): list(names)
-                    for slot, names in sorted(self.package_slot_map().items())
-                    if int(slot) > 0 and names
-                }
-            }
+            return {"slots": {k: v for k, v in sorted(live["slots"].items(), key=lambda kv: int(kv[0])) if v}}
+        names = set(self._headstamp_names(mid))
+        parent_names = {p.name for p in self.parents_repo.list_for_model(mid)} if mid is not None else set()
         return {
-            "headstamps": {str(e["name"]): int(e.get("slot", 0)) for e in self.headstamps if int(e.get("slot", 0)) > 0},
-            "parents": {str(p["name"]): int(p["slot"]) for p in self.parents_with_slots() if int(p["slot"]) > 0},
+            "headstamps": {n: s for n, s in live["headstamps"].items() if n in names},
+            "parents": {n: s for n, s in live["parents"].items() if n in parent_names},
         }
 
     def apply_slot_assignments(
@@ -578,7 +746,7 @@ class Config:
         assignments: dict[str, Any] | None,
         mode: str | None = None,
     ) -> None:
-        """Write a template payload back onto the live assignments.
+        """Write a template payload onto this tab's live layout.
 
         Names the payload doesn't mention are cleared to slot 0, so applying a
         template fully replaces the layout rather than merging into it. Unknown
@@ -586,59 +754,30 @@ class Config:
         """
         mode = self._resolve_template_mode(mode)
         data = assignments if isinstance(assignments, dict) else {}
-
+        mid = self.active_model_id
         if mode == "package":
-            raw = data.get("slots")
-            cleaned: dict[str, list[str]] = {}
-            if isinstance(raw, dict):
-                for key, names in raw.items():
-                    try:
-                        slot = int(key)
-                    except (TypeError, ValueError):
-                        continue
-                    if slot <= 0:
-                        continue
-                    cleaned[str(slot)] = [str(n) for n in (names or []) if n]
-            self.settings.set(self._package_slots_key(), cleaned)
+            self._write_live(mid, "package", {"slots": _package_slot_lists(data.get("slots"))})
             return
-
-        raw_hs_slots = data.get("headstamps")
-        hs_slots: dict[str, Any] = raw_hs_slots if isinstance(raw_hs_slots, dict) else {}
-        raw_parent_slots = data.get("parents")
-        parent_slots: dict[str, Any] = raw_parent_slots if isinstance(raw_parent_slots, dict) else {}
-
-        def _slot_of(table: dict[str, Any], name: str) -> int:
-            try:
-                return max(0, int(table.get(name, 0)))
-            except (TypeError, ValueError):
-                return 0
-
-        mid = self.settings.get_active_model_id()
-        with self.db.transaction() as _:
-            if mid is None:
-                entries = self._read_ai_headstamps()
-                for entry in entries:
-                    entry["slot"] = _slot_of(hs_slots, entry["name"])
-                self._write_ai_headstamps(entries)
-                return
-            for h in self.headstamps_repo.list_for_model(mid):
-                desired = _slot_of(hs_slots, h.name)
-                if int(h.slot) != desired:
-                    self.headstamps_repo.update_slot(h.id, desired)
-            for p in self.parents_repo.list_for_model(mid):
-                desired = _slot_of(parent_slots, p.name)
-                if int(p.slot) != desired:
-                    self.parents_repo.update_slot(p.id, desired)
+        names = set(self._headstamp_names(mid))
+        parent_names = {p.name for p in self.parents_repo.list_for_model(mid)} if mid is not None else set()
+        self._write_live(
+            mid,
+            "standard",
+            {
+                "headstamps": {n: s for n, s in _positive_slot_map(data.get("headstamps")).items() if n in names},
+                "parents": {n: s for n, s in _positive_slot_map(data.get("parents")).items() if n in parent_names},
+            },
+        )
 
     def list_slot_templates(self, mode: str | None = None) -> list[SlotTemplate]:
         """Templates for the active model + `mode`, newest scope seeded lazily.
 
         The first read of a scope with no templates creates "Default" holding
-        whatever is currently assigned, so upgrading users keep their layout
-        and land on a named template without doing anything.
+        whatever this tab currently has assigned, so upgrading users keep their
+        layout and land on a named template without doing anything.
         """
         mode = self._resolve_template_mode(mode)
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         rows = self.templates_repo.list_for_scope(mid, mode)
         if rows:
             return rows
@@ -653,25 +792,26 @@ class Config:
         return [template]
 
     def active_slot_template(self, mode: str | None = None) -> SlotTemplate:
-        """The template currently driving the live assignments for `mode`."""
+        """The template currently driving this tab's live assignments for `mode`."""
         mode = self._resolve_template_mode(mode)
         rows = self.list_slot_templates(mode)
         stored = self.settings.get(self._active_template_key(mode))
         for row in rows:
             if row.id == stored:
                 return row
-        # Pointer missing or stale (template deleted elsewhere): adopt the first
-        # one without applying it — the live assignments are what the user last
-        # worked on and the next sync writes them into it.
+        # Pointer missing or stale (template deleted elsewhere, or a tab that
+        # has never used this model): adopt the first one without applying it —
+        # the live assignments are what the tab last worked with, and the next
+        # sync writes them into it.
         self.settings.set(self._active_template_key(mode), rows[0].id)
         return rows[0]
 
     def sync_active_slot_template(self, mode: str | None = None) -> None:
-        """Persist the live assignments into the active template.
+        """Persist this tab's live assignments into its active template.
 
         Called after every slot-assignment mutation so the active template
-        never drifts from what the Run tab shows — there is no explicit "save
-        template" step.
+        never drifts from what the Sort page shows — there is no explicit
+        "save template" step.
         """
         mode = self._resolve_template_mode(mode)
         template = self.active_slot_template(mode)
@@ -685,13 +825,13 @@ class Config:
         template_id: int,
         mode: str | None = None,
     ) -> SlotTemplate | None:
-        """Switch to another template: save the outgoing one, load the incoming.
+        """Switch this tab to another template: save the outgoing one, load the incoming.
 
         Returns the newly active template, or None when `template_id` doesn't
         belong to the active model + mode.
         """
         mode = self._resolve_template_mode(mode)
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         target = self.templates_repo.get(int(template_id))
         if target is None or target.mode != mode or target.model_id != mid:
             return None
@@ -714,7 +854,7 @@ class Config:
         copy_current: bool = True,
         mode: str | None = None,
     ) -> SlotTemplate:
-        """Create a template and make it active.
+        """Create a template and make it active on this tab.
 
         With `copy_current` the new template starts as a copy of the live
         assignments (the outgoing template keeps its own copy); without it the
@@ -726,7 +866,7 @@ class Config:
         name = (name or "").strip()
         if not name:
             raise ValueError("Enter a name for the template.")
-        mid = self.settings.get_active_model_id()
+        mid = self.active_model_id
         if self.templates_repo.find_by_name(mid, mode, name) is not None:
             raise ValueError(f"A template named “{name}” already exists.")
         current = self.active_slot_template(mode)
@@ -764,11 +904,13 @@ class Config:
         return template
 
     def delete_slot_template(self, template_id: int) -> SlotTemplate | None:
-        """Delete a template and return whichever one is active afterwards.
+        """Delete a template and return whichever one is active on this tab afterwards.
 
-        Deleting the active template loads the next remaining one. The last
-        template in a scope can't be deleted — there is always somewhere for
-        the current assignments to live.
+        Deleting this tab's active template loads the next remaining one into
+        this tab. Another tab that had it active adopts the first remaining
+        template the next time it reads its pointer, without its live layout
+        changing. The last template in a scope can't be deleted — there is
+        always somewhere for the current assignments to live.
         """
         template = self.templates_repo.get(int(template_id))
         if template is None:
@@ -777,11 +919,13 @@ class Config:
         remaining = [t for t in self.templates_repo.list_for_scope(template.model_id, mode) if t.id != template.id]
         if not remaining:
             raise ValueError("A model needs at least one sorting template.")
-        key = self._template_key_for(template.model_id, mode)
+        key = self._active_template_key(mode, template.model_id) if template.model_id is not None else None
+        if key is None:
+            key = self._key(f"{_ACTIVE_TEMPLATE_KEY}:ai:{mode}")
         was_active = self.settings.get(key) == template.id
         # Only touch the live assignments when the template being deleted is
-        # the one currently loaded for the active model.
-        loaded = was_active and template.model_id == self.settings.get_active_model_id()
+        # the one currently loaded for this tab's active model.
+        loaded = was_active and template.model_id == self.active_model_id
         with self.db.transaction() as _:
             self.templates_repo.delete(template.id)
             if was_active:
@@ -794,17 +938,17 @@ class Config:
 
     @property
     def run_auto_select_trays(self) -> bool:
-        return bool(self.settings.get(_RUN_AUTO_SELECT_KEY, False))
+        return bool(self.settings.get(self._key(_RUN_AUTO_SELECT_KEY), False))
 
     def set_run_auto_select_trays(self, value: bool) -> None:
-        self.settings.set(_RUN_AUTO_SELECT_KEY, bool(value))
+        self.settings.set(self._key(_RUN_AUTO_SELECT_KEY), bool(value))
 
     @property
     def sort_while_training(self) -> bool:
-        return bool(self.settings.get(_SORT_WHILE_TRAINING_KEY, False))
+        return bool(self.settings.get(self._key(_SORT_WHILE_TRAINING_KEY), False))
 
     def set_sort_while_training(self, value: bool) -> None:
-        self.settings.set(_SORT_WHILE_TRAINING_KEY, bool(value))
+        self.settings.set(self._key(_SORT_WHILE_TRAINING_KEY), bool(value))
 
     # ----- empty-slot discovery (auto-select trays) --------------------------
 

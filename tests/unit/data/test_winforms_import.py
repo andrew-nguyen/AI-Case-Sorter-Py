@@ -24,6 +24,7 @@ from sorter.data.repository import (
     ModelRepo,
     SettingsRepo,
 )
+from sorter.data.sorters import ensure_default_sorter
 from sorter.data.winforms_import import (
     CONFIG_DB_NAME,
     FIRST_RUN_SEEN_KEY,
@@ -194,12 +195,13 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Database:
     monkeypatch.setenv("CASESORTER_DATA_DIR", str(tmp_path / "appdata"))
     database = Database(tmp_path / "appdata" / "config" / "casesorter.db")
     database.ensure_initialized()
+    ensure_default_sorter(database)
     return database
 
 
 @pytest.fixture
 def config(db: Database) -> Config:
-    return Config(db).load()
+    return Config(db, sorter_id=1).load()
 
 
 # ----- discovery --------------------------------------------------------------
@@ -510,7 +512,7 @@ def test_import_restores_package_mode_slots(tmp_path: Path, db: Database, config
     import_installation(root, db=db, config=config, options=ImportOptions())
 
     model = _model(db, "9mm Base Model")
-    SettingsRepo(db).set_active_model_id(model.id)
+    Config(db, sorter_id=1).set_active_model_id(model.id)
     assert config.package_slot_map() == {1: ["GECO"], 2: ["GECO"]}
     # The standard-mode row is untouched by a package-mode assignment.
     assert HeadstampRepo(db).list_for_model(model.id)[0].slot == 0
@@ -519,7 +521,7 @@ def test_import_restores_package_mode_slots(tmp_path: Path, db: Database, config
 def test_parent_runtime_preference_follows_the_model(tmp_path: Path, db: Database, config: Config) -> None:
     root = _write_install(tmp_path / "legacy", models=[_MODEL_COMMUNITY])
     import_installation(root, db=db, config=config, options=ImportOptions())
-    SettingsRepo(db).set_active_model_id(_model(db, "9mm Default").id)
+    Config(db, sorter_id=1).set_active_model_id(_model(db, "9mm Default").id)
     assert config.use_parent_classifications
 
 
@@ -585,7 +587,7 @@ def test_serial_settings_import(tmp_path: Path, db: Database, config: Config) ->
     )
 
     assert result.serial_imported
-    reloaded = Config(db).load()
+    reloaded = Config(db, sorter_id=1).load()
     assert reloaded.serial["port"] == "COM3"
     assert reloaded.serial["baud"] == 19200
     assert reloaded.serial["slot_quantity"] == 8
@@ -611,7 +613,7 @@ def test_image_processing_import_touches_linescan_only(tmp_path: Path, db: Datab
     )
 
     assert result.image_processing_imported
-    reloaded = Config(db).load()
+    reloaded = Config(db, sorter_id=1).load()
     assert reloaded.image_proc["linescan"]["scan_precision"] == 5
     assert reloaded.image_proc["linescan"]["bg_cliff"] == 25
     assert reloaded.image_proc["hough"] == hough_before
@@ -636,7 +638,7 @@ def test_ai_config_import(tmp_path: Path, db: Database, config: Config) -> None:
     )
 
     assert result.ai_config_imported
-    api = Config(db).load().api
+    api = Config(db, sorter_id=1).load().api
     assert api["endpoint_url"] == "http://192.168.1.5:8000"
     assert api["model"] == "qwen-vl"
     assert api["image_quality"] == 90
@@ -671,7 +673,7 @@ def test_ai_config_prefers_the_model_that_classified_over_http(tmp_path: Path, d
     )
 
     assert result.ai_config_imported
-    api = Config(db).load().api
+    api = Config(db, sorter_id=1).load().api
     assert api["endpoint_url"] == "http://192.168.1.9:1234/v1/chat/completions"
     assert api["model"] == "qwen2-vl"
 
@@ -857,7 +859,7 @@ def test_nothing_ticked_is_a_no_op(tmp_path: Path, db: Database, config: Config)
 def test_import_adopts_the_legacy_active_model(tmp_path: Path, db: Database, config: Config) -> None:
     root = _write_install(tmp_path / "legacy")  # Defaults.DefaultModelId == 4
     result = import_installation(root, db=db, config=config, options=ImportOptions())
-    active = SettingsRepo(db).get_active_model_id()
+    active = Config(db, sorter_id=1).active_model_id
     assert active is not None
     assert result.activated_model_id == active
     assert active == _model(db, "9mm Default").id
@@ -866,13 +868,13 @@ def test_import_adopts_the_legacy_active_model(tmp_path: Path, db: Database, con
 def test_import_never_overrides_a_choice_already_made_here(tmp_path: Path, db: Database, config: Config) -> None:
     """The import is an offer, not a takeover."""
     existing = ModelRepo(db).list()[0]
-    SettingsRepo(db).set_active_model_id(existing.id)
+    Config(db, sorter_id=1).set_active_model_id(existing.id)
     root = _write_install(tmp_path / "legacy")
 
     result = import_installation(root, db=db, config=config, options=ImportOptions())
 
     assert result.activated_model_id is None
-    assert SettingsRepo(db).get_active_model_id() == existing.id
+    assert Config(db, sorter_id=1).active_model_id == existing.id
 
 
 # ----- the first-run offer ----------------------------------------------------
@@ -903,7 +905,7 @@ def test_first_run_offer_stays_silent_for_an_app_already_in_use(
     monkeypatch.delenv("ProgramFiles(x86)", raising=False)
     assert should_offer_first_run(db) == root
 
-    SettingsRepo(db).set_active_model_id(ModelRepo(db).list()[0].id)
+    Config(db, sorter_id=1).set_active_model_id(ModelRepo(db).list()[0].id)
     assert should_offer_first_run(db) is None
 
 

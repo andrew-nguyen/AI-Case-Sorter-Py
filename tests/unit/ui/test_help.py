@@ -48,6 +48,7 @@ def _block_text(window: HelpWindow) -> str:
     ("page_name", "settings_section", "expected"),
     [
         ("Sort", None, "sort-dashboard"),
+        ("All sorters", None, "all-sorters"),
         ("Settings", "Serial", "serial"),
         ("Settings", "Camera", "camera"),
         ("Settings", "Image Processing", "image-processing"),
@@ -325,9 +326,11 @@ def test_every_topic_the_shell_can_ask_for_has_a_heading() -> None:
     degrades to the top of the guide, which this catches instead.
     """
     from sorter.ui.app import ACTIVITIES, MODE_ACTIVITIES, SETTINGS_SECTIONS
+    from sorter.ui.dashboard_page import DASHBOARD_TITLE
 
     headings = _headings(GUIDE_MD.read_text(encoding="utf-8"))
     topics = {topic_for(name) for _icon, name in (*ACTIVITIES, *MODE_ACTIVITIES)}
+    topics.add(topic_for(DASHBOARD_TITLE))
     topics |= {topic_for("Settings", section) for section in SETTINGS_SECTIONS}
     topics.add(topic_for("Settings"))
     for topic in topics:

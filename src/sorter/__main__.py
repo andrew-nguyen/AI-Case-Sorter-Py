@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     from sorter.community import appenv
     from sorter.data.config import Config
     from sorter.data.db import Database
+    from sorter.data.sorters import ensure_default_sorter, front_sorter_id
 
     # Before anything that logs. The data-folder move below is the one thing
     # that can't be: it decides where the log file goes.
@@ -73,7 +74,12 @@ def main(argv: list[str] | None = None) -> int:
     db = Database()
     db.ensure_initialized(legacy_config_json=legacy_json if legacy_json.exists() else None)
 
-    config = Config(db).load()
+    # A single-machine install becomes "Sorter 1" here, once, before anything
+    # reads a tab's settings.
+    roster = ensure_default_sorter(db)
+    front = front_sorter_id(db)
+    sorter_id = front if front in {r.id for r in roster} else roster[0].id
+    config = Config(db, sorter_id=sorter_id).load()
 
     from sorter.ui.app import run_app
 

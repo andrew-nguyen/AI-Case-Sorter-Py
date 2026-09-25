@@ -81,7 +81,7 @@ TARGET_MODEL_TEXT = "Settings of the active OpenAI model “{name}” — saved 
 
 def ai_config_mode(win: Any) -> bool:
     """AI Config mode = no active local model. The app-level settings apply."""
-    return win.config.settings.get_active_model_id() is None
+    return win.config.active_model_id is None
 
 
 def openai_target(win: Any) -> Model | None:
@@ -90,7 +90,7 @@ def openai_target(win: Any) -> Model | None:
     None in AI Config mode and for any ConvNeXt/community model. Read fresh on
     every call, like ``active_model_name``.
     """
-    model_id = win.config.settings.get_active_model_id()
+    model_id = win.config.active_model_id
     if model_id is None:
         return None
     model = ModelRepo(win.config.db).get(model_id)
@@ -99,7 +99,7 @@ def openai_target(win: Any) -> Model | None:
 
 def active_model_name(win: Any) -> str | None:
     """Read fresh — the explainer names whatever is classifying right now."""
-    model_id = win.config.settings.get_active_model_id()
+    model_id = win.config.active_model_id
     if model_id is None:
         return None
     model = ModelRepo(win.config.db).get(model_id)
@@ -244,8 +244,7 @@ class AiSection(QWidget):
     def save(self) -> None:
         values = self._field_values()
         if self._target_model_id is None:
-            self._win.config.api.update(values)
-            self._win.config.save()
+            self._win.config.save_api({**self._win.config.api, **values})
             self._win.set_status("AI settings saved.")
             return
         repo = ModelRepo(self._win.config.db)

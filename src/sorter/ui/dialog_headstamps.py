@@ -20,9 +20,16 @@ Three semantics to get right, because getting them wrong loses data:
 Two things about the mechanics:
 
 * **Slots are editable here and write through immediately**, like every other
-  slot surface. Each write posts ``run/assignment_changed`` and re-syncs the
-  active sorting template (only when this model is the active one: the
-  template API is scoped to the active model).
+  slot surface, into the layout the "Slots for" dropdown names. Each sorter
+  tab keeps its own live layout per model (see ``data/config.py``), and the
+  ``headstamps.slot`` column is only the model's *default* layout, which a tab
+  copies the first time it uses the model. The dropdown therefore offers
+  "Model default" plus every sorter tab on which this model is active — a tab
+  running another model has no live layout for this one to edit — and opens
+  on the front tab when it is one of them. A tab write goes through that
+  tab's ``Config``, which re-syncs its active sorting template, and posts
+  ``run/assignment_changed`` on that tab's bus only. A rename is carried into
+  every tab's layout, because those layouts are keyed by name.
 * **A rename's file work runs on a QThread**, reporting back through a queued
   signal — a well-used model has thousands of images.
 
@@ -34,6 +41,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -61,8 +69,9 @@ from PySide6.QtWidgets import (
 )
 
 from ..data import image_store
+from ..data.config import rename_in_live_layouts
 from ..data.models import Headstamp, HeadstampParent
-from ..data.repository import HeadstampParentRepo, HeadstampRepo, ModelRepo, SettingsRepo
+from ..data.repository import HeadstampParentRepo, HeadstampRepo, ModelRepo
 from ..paths import model_images_dir
 
 # A headstamp name becomes a filename prefix, and `__` is the field separator.
@@ -75,6 +84,29 @@ UNASSIGNED_SLOT = "—"
 SUGGESTED_MARK = "  (suggested)"
 
 COLUMNS = ("Headstamp", "Slot", "Parent")
+MODEL_DEFAULT_LABEL = "Model default"
+SLOTS_FOR_TOOLTIP = (
+    "Which bin layout the Slot box edits. Each sorter tab running this model keeps "
+    "its own layout; the model default is what a tab starts from the first time "
+    "it uses the model."
+)
+
+
+@dataclass(frozen=True)
+class SlotTarget:
+    """A sorter tab whose live bin layout the editor may write.
+
+    `config` is that tab's `Config` and `bus` its event bus; `front` marks the
+    tab the user is looking at, which is where the dropdown opens.
+    """
+
+    sorter_id: int
+    name: str
+    config: Any
+    bus: Any
+    front: bool = False
+
+
 PARENT_HINT = "Parent assignments are staged — press Save to write them."
 RENAME_HINT = "Renaming a headstamp also renames its training images on disk."
 
@@ -137,6 +169,7 @@ class HeadstampManagerDialog(QDialog):
         *,
         bus: Any = None,
         images_dir: Path | str | None = None,
+        slot_targets: Callable[[], list[SlotTarget]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.config = config
@@ -145,7 +178,10 @@ class HeadstampManagerDialog(QDialog):
         self.bus = bus
         self.headstamps = HeadstampRepo(self.db)
         self.parents = HeadstampParentRepo(self.db)
-        self.settings = SettingsRepo(self.db)
+        # Every sorter tab, read fresh; the dropdown keeps the ones running
+        # this model. None (tests, no window) offers the model default only.
+        self._slot_targets_source = slot_targets or (lambda: [])
+        self._targets: list[SlotTarget] = []
         self.images_dir = Path(images_dir) if images_dir is not None else model_images_dir(self.model_id)
 
         model = ModelRepo(self.db).get(self.model_id)
@@ -170,6 +206,14 @@ class HeadstampManagerDialog(QDialog):
 
         self._build_ui()
         self._load_assignments()
+        self.refresh_slot_targets()
+        # A model activated or deactivated on some tab while this is open
+        # changes which layouts can be edited.
+        self._subscribed: list[Any] = [b for b in {id(t.bus): t.bus for t in self._all_targets()}.values()]
+        if self.bus is not None and all(b is not self.bus for b in self._subscribed):
+            self._subscribed.append(self.bus)
+        for bus_ in self._subscribed:
+            bus_.subscribe("mode/changed", self._on_mode_changed)
         self.refresh()
 
     # ----- construction -------------------------------------------------------
@@ -271,6 +315,11 @@ class HeadstampManagerDialog(QDialog):
         action_row.addWidget(self.rename_button)
         action_row.addWidget(self.delete_button)
         action_row.addSpacing(12)
+        action_row.addWidget(QLabel("Slots for", box))
+        self.target_combo = QComboBox(box)
+        self.target_combo.setToolTip(SLOTS_FOR_TOOLTIP)
+        self.target_combo.currentIndexChanged.connect(self._on_target_changed)
+        action_row.addWidget(self.target_combo)
         action_row.addWidget(QLabel("Slot", box))
         self.slot_spin = QSpinBox(box)
         self.slot_spin.setRange(0, int(self.config.serial.get("slot_quantity", 8)))
@@ -370,8 +419,49 @@ class HeadstampManagerDialog(QDialog):
             self.tree.setCurrentItem(first)
         self._on_selection_changed()
 
+    # ----- which layout the Slot box edits ------------------------------------
+
+    def _all_targets(self) -> list[SlotTarget]:
+        return list(self._slot_targets_source())
+
+    def refresh_slot_targets(self) -> None:
+        """Rebuild "Slots for": the model default plus the tabs running this model."""
+        previous = self.slot_target()
+        self._targets = [t for t in self._all_targets() if t.config.active_model_id == self.model_id]
+        self._syncing = True
+        self.target_combo.clear()
+        self.target_combo.addItem(MODEL_DEFAULT_LABEL, None)
+        for target in self._targets:
+            self.target_combo.addItem(target.name, target.sorter_id)
+        keep = previous.sorter_id if previous is not None else None
+        front = next((t.sorter_id for t in self._targets if t.front), None)
+        wanted = keep if keep is not None and self.target_combo.findData(keep) >= 0 else front
+        self.target_combo.setCurrentIndex(max(0, self.target_combo.findData(wanted)) if wanted is not None else 0)
+        self._syncing = False
+
+    def slot_target(self) -> SlotTarget | None:
+        """The tab the Slot box edits, or None for the model default."""
+        if not hasattr(self, "target_combo"):
+            return None
+        sorter_id = self.target_combo.currentData()
+        return next((t for t in self._targets if t.sorter_id == sorter_id), None)
+
+    def _on_target_changed(self, _index: int) -> None:
+        if not self._syncing:
+            self._refresh_headstamps()
+
+    def _on_mode_changed(self, _payload: Any) -> None:
+        self.refresh_slot_targets()
+        self._refresh_headstamps()
+
+    def _slot_of(self, headstamp: Headstamp) -> int:
+        target = self.slot_target()
+        if target is None:
+            return int(headstamp.slot)
+        return next((int(h["slot"]) for h in target.config.headstamps if h["name"] == headstamp.name), 0)
+
     def _row_values(self, headstamp: Headstamp) -> list[str]:
-        slot = int(headstamp.slot)
+        slot = self._slot_of(headstamp)
         return [
             headstamp.name,
             str(slot) if slot else UNASSIGNED_SLOT,
@@ -410,7 +500,7 @@ class HeadstampManagerDialog(QDialog):
         for widget in (self.rename_button, self.delete_button, self.slot_spin, self.parent_combo):
             widget.setEnabled(headstamp is not None)
         self._syncing = True
-        self.slot_spin.setValue(int(headstamp.slot) if headstamp is not None else 0)
+        self.slot_spin.setValue(self._slot_of(headstamp) if headstamp is not None else 0)
         staged = self._assignments.get(headstamp.id) if headstamp is not None else None
         index = self.parent_combo.findData(staged)
         self.parent_combo.setCurrentIndex(max(0, index))
@@ -429,21 +519,24 @@ class HeadstampManagerDialog(QDialog):
 
     # ----- write-through helpers ----------------------------------------------
 
-    def _announce(self) -> None:
-        """Nudge the Sort grid — it re-reads assignments off this topic."""
+    def _announce(self, targets: list[SlotTarget] | None = None) -> None:
+        """Nudge the Sort grid of each tab in `targets` (default: every tab
+        running this model) — the grid re-reads assignments off this topic."""
         self._mutated = True
-        if self.bus is not None:
-            self.bus.post("run/assignment_changed", {"source": "headstamps", "model_id": self.model_id})
+        payload = {"source": "headstamps", "model_id": self.model_id}
+        for target in self._targets if targets is None else targets:
+            target.bus.post("run/assignment_changed", payload)
 
     def _sync_template(self) -> None:
-        """Keep the active sorting template in lock-step (CLAUDE.md §4).
+        """Keep each running tab's active sorting template in lock-step (CLAUDE.md §4).
 
-        Only when this model is the active one: the template API resolves its
-        scope from the active model, so syncing for any other model would
-        overwrite the active model's template with this one's assignments.
+        Only tabs running this model: the template API resolves its scope from
+        the tab's active model, so syncing a tab on another model would
+        overwrite that model's template with this one's assignments.
         """
-        if self.settings.get_active_model_id() == self.model_id:
-            self.config.sync_active_slot_template("standard")
+        for target in self._targets:
+            if target.config.active_model_id == self.model_id:
+                target.config.sync_active_slot_template("standard")
 
     # ----- headstamp CRUD -----------------------------------------------------
 
@@ -489,6 +582,7 @@ class HeadstampManagerDialog(QDialog):
             return
         with self.db.transaction():
             self.headstamps.rename(headstamp.id, name)
+            rename_in_live_layouts(self.db, self.model_id, headstamp.name, name)
         # The template payload is name-keyed, so a rename has to re-snapshot it
         # or the layout still points at a name nothing answers to, and the
         # assignment silently drops next time the template applies.
@@ -516,12 +610,17 @@ class HeadstampManagerDialog(QDialog):
 
     def _on_slot_changed(self, value: int) -> None:
         headstamp = self.selected_headstamp()
-        if self._syncing or headstamp is None or int(headstamp.slot) == int(value):
+        if self._syncing or headstamp is None or self._slot_of(headstamp) == int(value):
             return
-        with self.db.transaction():
-            self.headstamps.update_slot(headstamp.id, int(value))
-        self._sync_template()
-        self._announce()
+        target = self.slot_target()
+        if target is None:
+            # The model default moves no running tab, so there is no grid to nudge.
+            with self.db.transaction():
+                self.headstamps.update_slot(headstamp.id, int(value))
+            self._mutated = True
+        else:
+            target.config.set_headstamp_slot(headstamp.name, int(value))
+            self._announce([target])
         self._refresh_headstamps()
         self.status_label.setText(f"'{headstamp.name}' → slot {value}." if value else f"'{headstamp.name}' unassigned.")
 
@@ -578,6 +677,7 @@ class HeadstampManagerDialog(QDialog):
             return
         with self.db.transaction():
             self.parents.rename(parent.id, name)
+            rename_in_live_layouts(self.db, self.model_id, parent.name, name, parent=True)
         self._sync_template()
         self._announce()
         self._refresh_parents()
@@ -690,10 +790,17 @@ class HeadstampManagerDialog(QDialog):
             return
         for worker in list(self._workers):
             worker.wait(2000)
+        for bus_ in self._subscribed:
+            bus_.unsubscribe("mode/changed", self._on_mode_changed)
+        self._subscribed = []
         if self._mutated:
             # The Train page's label list and the Models row counts follow the
-            # headstamp set.
+            # headstamp set — on every tab running this model, and on the
+            # host's own bus when it has one.
+            buses = {id(t.bus): t.bus for t in self._all_targets() if t.config.active_model_id == self.model_id}
             if self.bus is not None:
-                self.bus.post("mode/changed", {"reason": "headstamps", "model_id": self.model_id})
+                buses.setdefault(id(self.bus), self.bus)
+            for bus_ in buses.values():
+                bus_.post("mode/changed", {"reason": "headstamps", "model_id": self.model_id})
             self.changed.emit()
         super().reject()

@@ -27,7 +27,7 @@ pytest.importorskip("PySide6")
 from sorter import paths
 from sorter.data import image_store
 from sorter.data.config import Config
-from sorter.data.repository import HeadstampParentRepo, HeadstampRepo, SettingsRepo
+from sorter.data.repository import HeadstampParentRepo, HeadstampRepo
 from sorter.ui.dialog_headstamps import (
     NONE_LABEL,
     SUGGESTED_MARK,
@@ -36,7 +36,7 @@ from sorter.ui.dialog_headstamps import (
     prefix_groups,
 )
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 
 @pytest.fixture(autouse=True)
@@ -85,10 +85,19 @@ def _fail_text(title: str, label: str, initial: str) -> str | None:
     pytest.fail(f"unexpected text prompt: {title} — {label}")
 
 
-def _make_dialog(config: Any, model_id: int, *, bus: Any = None) -> Any:
+def _make_dialog(config: Any, model_id: int, *, bus: Any = None, window: Any = None) -> Any:
     """A dialog with every modal replaced. Returns ``Any``: the tests read the
-    recorders back off ``notify``/``confirm``, which are plain attributes."""
-    dialog = HeadstampManagerDialog(None, config, model_id, bus=bus)
+    recorders back off ``notify``/``confirm``, which are plain attributes.
+
+    With a `window`, the "Slots for" list is the window's sorter tabs, as in the
+    app; without one it offers the model default only."""
+    dialog = HeadstampManagerDialog(
+        None,
+        config,
+        model_id,
+        bus=window.bus if window is not None else bus,
+        slot_targets=window.slot_targets if window is not None else None,
+    )
     dialog.notify = _Recorder()
     dialog.confirm = _Asker(True)
     dialog.ask_text = _fail_text
@@ -161,7 +170,7 @@ def _db_parents(config: Config, model_id: int) -> dict[str, int]:
 
 def _fresh(config: Config) -> Config:
     """A second Config on the same DB — proves a mutation actually persisted."""
-    return Config(config.db).load()
+    return Config(config.db, sorter_id=1).load()
 
 
 # ----- the name rules ---------------------------------------------------------
@@ -374,7 +383,7 @@ def test_slot_edit_of_a_non_active_model_leaves_the_active_template_alone(qapp, 
     active = seed_model(config, {"Active hs": 5}, name="Active")
     other = seed_model(config, {"Other hs": 0}, name="Other")
     # seed_model activates whatever it created last; put the first one back.
-    SettingsRepo(config.db).set_active_model_id(active)
+    config.set_active_model_id(active)
     before = _fresh(config).active_slot_template("standard").assignments
     dialog = _make_dialog(config, other)
     _select(dialog, "Other hs")
@@ -605,43 +614,43 @@ def test_slot_edits_alone_never_trigger_the_guard(qapp, config) -> None:
 
 def test_mutations_reach_the_sort_grid_through_the_bus(qapp, config, window) -> None:
     model_id = seed_model(config, {"WIN 9mm": 0})
-    dialog = _make_dialog(config, model_id, bus=window.bus)
+    dialog = _make_dialog(config, model_id, window=window)
     _select(dialog, "WIN 9mm")
 
     dialog.slot_spin.setValue(2)
 
     # No shortcut: the window's own `run/assignment_changed` subscription is
     # what repaints the grid.
-    assert drain_until(window, lambda: window.slot_grid.cards[2].names_label.text() == "WIN 9mm")
+    assert drain_until(window, lambda: tab(window).slot_grid.cards[2].names_label.text() == "WIN 9mm")
 
     dialog.name_edit.setText("FED 45")
     dialog.add_button.click()
     _select(dialog, "FED 45")
     dialog.slot_spin.setValue(2)
 
-    assert drain_until(window, lambda: window.slot_grid.cards[2].names_label.text() == "FED 45, WIN 9mm")
+    assert drain_until(window, lambda: tab(window).slot_grid.cards[2].names_label.text() == "FED 45, WIN 9mm")
 
 
 def test_rename_repaints_the_grid_and_moves_the_images(qapp, config, window) -> None:
     model_id = seed_model(config, {"WIN 9mm": 2})
     images_dir = paths.model_images_dir(model_id)
     _seed_images(images_dir, {"WIN 9mm": 2})
-    dialog = _make_dialog(config, model_id, bus=window.bus)
+    dialog = _make_dialog(config, model_id, window=window)
     dialog.ask_text = lambda _title, _label, _initial: "WIN 9x19"
     _select(dialog, "WIN 9mm")
 
     dialog.rename_button.click()
     _wait_for_rename(qapp, dialog)
 
-    assert drain_until(window, lambda: window.slot_grid.cards[2].names_label.text() == "WIN 9x19")
+    assert drain_until(window, lambda: tab(window).slot_grid.cards[2].names_label.text() == "WIN 9x19")
     assert {p.name for p in image_store.list_images(images_dir)} == {"WIN 9x19__1.jpg", "WIN 9x19__2.jpg"}
 
 
 def test_closing_after_a_write_tells_the_app_the_headstamp_set_changed(qapp, config, window) -> None:
     model_id = seed_model(config, {"WIN 9mm": 1})
     posted: list[Any] = []
-    window.bus.subscribe("mode/changed", posted.append)
-    dialog = _make_dialog(config, model_id, bus=window.bus)
+    tab(window).bus.subscribe("mode/changed", posted.append)
+    dialog = _make_dialog(config, model_id, window=window)
     dialog.show()
     dialog.name_edit.setText("FED 45")
     dialog.add_button.click()
@@ -654,11 +663,11 @@ def test_closing_after_a_write_tells_the_app_the_headstamp_set_changed(qapp, con
 def test_closing_without_a_write_stays_quiet(qapp, config, window) -> None:
     model_id = seed_model(config, {"WIN 9mm": 1})
     posted: list[Any] = []
-    window.bus.subscribe("mode/changed", posted.append)
-    dialog = _make_dialog(config, model_id, bus=window.bus)
+    tab(window).bus.subscribe("mode/changed", posted.append)
+    dialog = _make_dialog(config, model_id, window=window)
     dialog.show()
 
     dialog.close()
 
-    window.bus.drain()
+    window.drain_all()
     assert posted == []

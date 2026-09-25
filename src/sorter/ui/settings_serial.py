@@ -3,8 +3,9 @@ test, airdrop config.
 
 The protocol reference is ``hardware/serial_broker.py``. This module owns the
 whole connect/disconnect/refresh flow itself rather than reusing
-``QtMainWindow.connect_serial``/``refresh_ports``, since those read from
-widgets that don't exist on this page.
+``SorterTab.connect_serial``, since that reads the port from the tab's saved
+config rather than from this page's combo. It is built once per sorter tab,
+and every port another tab holds is listed as "in use by <tab>" and refused.
 
 The traffic log is deliberately not duplicated here — the serial panel
 (``ui/serial_monitor.py``) already renders ``serial/rx``/``serial/tx``/
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -42,6 +44,7 @@ from PySide6.QtWidgets import (
 from ..hardware import serial_broker
 from ..hardware.serial_emulator import EMULATED_PORT, EmulatorBroker
 from ..hardware.serial_log import SERIAL_LOG_PREFIX
+from .device_registry import in_use_label
 from .message_log import ERROR
 
 BAUD_CHOICES = (9600, 19200, 38400, 57600, 115200)
@@ -174,21 +177,43 @@ class SerialSection(QWidget):
     def refresh_ports(self) -> None:
         """Emulated first, then USB/ACM/COM adapters, then the rest.
 
-        Same ordering as ``app.py``'s (superseded) ``refresh_ports`` — a real
-        board lives on a USB/ACM adapter, and Linux otherwise buries it under
-        32 legacy ``/dev/ttyS*`` UARTs.
+        A real board lives on a USB/ACM adapter, and Linux otherwise buries it
+        under 32 legacy ``/dev/ttyS*`` UARTs. A port another sorter tab holds
+        stays listed, labelled "in use by <tab>" and not selectable, so the
+        operator sees where their board went instead of it vanishing.
         """
-        selected = self.port_combo.currentText() or (self._win.config.serial.get("port") or "").strip()
+        selected = self.selected_port() or (self._win.config.serial.get("port") or "").strip()
         detected = serial_broker.list_serial_ports()
         # Case-insensitive: macOS adapters are lowercase (/dev/cu.usbmodem…).
         # COM is a prefix, not a substring — "cu.Bluetooth-Incoming-Port"
         # contains it and is exactly the kind of port this ordering demotes.
         likely = [p for p in detected if "USB" in p.upper() or "ACM" in p.upper() or p.upper().startswith("COM")]
         ports = [EMULATED_PORT, *likely, *(p for p in detected if p not in likely)]
+        blocked = self.port_combo.blockSignals(True)
         self.port_combo.clear()
-        self.port_combo.addItems(ports)
-        if selected in ports:
-            self.port_combo.setCurrentText(selected)
+        model = self.port_combo.model()
+        for port in ports:
+            holder = self._win.devices.serial_holder(port, self._win.sorter_id)
+            self.port_combo.addItem(port if holder is None else f"{port} ({in_use_label(holder)})", port)
+            if holder is not None and isinstance(model, QStandardItemModel):
+                item = model.item(self.port_combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
+        index = self.port_combo.findData(selected)
+        if index >= 0 and self._win.devices.serial_holder(selected, self._win.sorter_id) is None:
+            self.port_combo.setCurrentIndex(index)
+        self.port_combo.blockSignals(blocked)
+
+    def selected_port(self) -> str:
+        """The port the combo names — its data, since an in-use entry's text is decorated."""
+        data = self.port_combo.currentData()
+        return str(data if data else self.port_combo.currentText()).strip()
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        # Another tab may have connected or let go of a port since this page
+        # was last drawn; the list is cheap and never cached.
+        self.refresh_ports()
 
     def connect_port(self) -> None:
         """Open the port shown in the combo. Emulated is instant; a real port
@@ -199,12 +224,19 @@ class SerialSection(QWidget):
         violation.
         """
         win = self._win
-        self._stop_current_broker()
-        port = self.port_combo.currentText().strip()
+        port = self.selected_port()
         if not port:
+            self._stop_current_broker()
             win.set_status("No port selected.")
             win._set_serial_indicator("Serial: no port selected", connected=False)
             return
+        holder = win.devices.serial_holder(port, win.sorter_id)
+        if holder is not None:
+            # Refused before this tab's own board is touched: picking a port
+            # someone else holds must not cost this tab its connection.
+            win._refuse_serial(port, holder)
+            return
+        self._stop_current_broker()
 
         if port == EMULATED_PORT:
             broker: Any = EmulatorBroker()
@@ -267,9 +299,8 @@ class SerialSection(QWidget):
             pass
         win.broker = None
         win.run_controller = None
-        update_buttons = getattr(win, "_update_run_buttons", None)
-        if update_buttons is not None:
-            update_buttons()
+        win.devices.release_serial(win.sorter_id)
+        win._update_run_buttons()
 
     def _on_baud_activated(self, index: int) -> None:
         """User picked a speed: persist it, tell the monitor's picker, and —

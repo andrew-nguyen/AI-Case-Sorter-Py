@@ -249,7 +249,7 @@ def test_a_saved_theme_is_back_on_the_next_launch(window, config, window_factory
 
     db = Database(tmp_path / "casesorter.db")
     db.ensure_initialized()
-    again = Config(db).load()
+    again = Config(db, sorter_id=1).load()
     second = window_factory(again)
 
     assert THEMES["Mine"]["action"] == "#abcdef"

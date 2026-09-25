@@ -21,7 +21,7 @@ from PySide6.QtCore import Qt
 from sorter.hardware.serial_emulator import EMULATED_PORT
 from sorter.ui.app import SIDEBAR_ICON_SIZE, default_qpa_platform
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 
 def _icon_bytes(button) -> bytes:
@@ -86,7 +86,7 @@ def test_about_dialog_has_no_firmware_line_without_a_broker(window) -> None:
 def test_about_dialog_shows_firmware_version_when_a_broker_is_live(window) -> None:
     from sorter.ui.dialog_about import AboutDialog
 
-    window.broker = types.SimpleNamespace(firmware_version="CS7.2-1.7")
+    tab(window).broker = types.SimpleNamespace(firmware_version="CS7.2-1.7")
 
     dialog = AboutDialog(window)
 
@@ -151,38 +151,38 @@ def test_license_dialog_handles_a_missing_license_file(window, monkeypatch, tmp_
 
 def test_fresh_window_shows_the_empty_state(window) -> None:
     # No board, no camera, and the seeded default model has no headstamps.
-    assert window.sort_stack.currentIndex() == 1
+    assert tab(window).sort_stack.currentIndex() == 1
 
 
 def test_empty_state_clears_once_serial_connects(window) -> None:
-    window.connect_serial(EMULATED_PORT)
+    tab(window).connect_serial(EMULATED_PORT)
 
-    assert window.sort_stack.currentIndex() == 0
+    assert tab(window).sort_stack.currentIndex() == 0
 
 
 def test_empty_state_clears_once_the_camera_connects(window) -> None:
-    window._set_camera_indicator("Camera: connected (640x480)", connected=True)
+    tab(window)._set_camera_indicator("Camera: connected (640x480)", connected=True)
 
-    assert window.sort_stack.currentIndex() == 0
+    assert tab(window).sort_stack.currentIndex() == 0
 
 
 def test_empty_state_clears_once_something_is_assigned_even_disconnected(window, config) -> None:
-    assert window.sort_stack.currentIndex() == 1
+    assert tab(window).sort_stack.currentIndex() == 1
 
     seed_model(config, {"9mm FC": 1})
-    window.bus.post("mode/changed", None)
-    window.bus.drain()
+    tab(window).bus.post("mode/changed", None)
+    window.drain_all()
 
-    assert window.sort_stack.currentIndex() == 0
+    assert tab(window).sort_stack.currentIndex() == 0
 
 
 def test_empty_state_panel_links_to_settings_serial_and_camera(window) -> None:
-    window.empty_state_board_button.click()
+    tab(window).empty_state_board_button.click()
     assert window.settings_list.currentItem().text() == "Serial"
     assert window.pages.currentWidget() is window._pages_by_name["Settings"]
 
     window.sidebar_buttons["Sort"].click()
-    window.empty_state_camera_button.click()
+    tab(window).empty_state_camera_button.click()
     assert window.settings_list.currentItem().text() == "Camera"
 
 
@@ -245,9 +245,9 @@ def test_minimum_size_matches_the_tk_reference(window) -> None:
 def test_close_does_not_prompt_during_a_run(window) -> None:
     # No confirmation, ever — see the judgment-call register. A stand-in
     # controller is enough; nothing here needs a real board.
-    window.run_controller = types.SimpleNamespace(stop=lambda: None)
-    window.bus.post("run/started", None)
-    window.bus.drain()
+    tab(window).run_controller = types.SimpleNamespace(stop=lambda: None)
+    tab(window).bus.post("run/started", None)
+    window.drain_all()
 
     calls = []
     window.notify = lambda *a, **k: calls.append(a)
@@ -360,7 +360,7 @@ def test_device_indicator_appears_once_a_local_model_classifies(window, config, 
     monkeypatch.setattr(local_inference, "device_description", lambda: "MPS · Apple M4 Pro")
     window.show()
 
-    window.bus.post("run/classified", {"label": "FC", "confidence": 90.0, "slot": 1})
+    tab(window).bus.post("run/classified", {"label": "FC", "confidence": 90.0, "slot": 1})
     assert drain_until(window, lambda: window.device_label.isVisible())
     assert window.device_label.text() == "Inference: MPS · Apple M4 Pro"
 
@@ -372,23 +372,22 @@ def test_device_indicator_stays_hidden_in_ai_config_mode(window, monkeypatch) ->
     monkeypatch.setattr(local_inference, "device_description", lambda: "CPU")
     window.show()
 
-    window.bus.post("test/classified", {"label": "FC", "confidence": 90.0})
-    window.bus.drain()
+    tab(window).bus.post("test/classified", {"label": "FC", "confidence": 90.0})
+    window.drain_all()
     assert not window.device_label.isVisible()
 
 
 def test_device_indicator_hides_when_the_mode_leaves_local(window, config, monkeypatch) -> None:
-    from sorter.data.repository import SettingsRepo
     from sorter.ml import local_inference
 
     seed_model(config, {"FC": 1})
     monkeypatch.setattr(local_inference, "device_description", lambda: "CPU")
     window.show()
-    window.bus.post("run/classified", {"label": "FC", "confidence": 90.0, "slot": 1})
+    tab(window).bus.post("run/classified", {"label": "FC", "confidence": 90.0, "slot": 1})
     assert drain_until(window, lambda: window.device_label.isVisible())
 
-    SettingsRepo(config.db).clear_active_model()
-    window.bus.post("mode/changed", None)
+    config.set_active_model_id(None)
+    tab(window).bus.post("mode/changed", None)
     assert drain_until(window, lambda: not window.device_label.isVisible())
 
 
@@ -417,7 +416,7 @@ def test_auto_connect_skips_bluetooth_ports_on_darwin(window, monkeypatch) -> No
     )
     monkeypatch.setattr(serial_broker, "SerialBroker", _DeafBroker)
     notes: list[str] = []
-    window.bus.subscribe("serial/note", notes.append)
+    tab(window).bus.subscribe("serial/note", notes.append)
 
     window._auto_connect_serial()
     assert drain_until(window, lambda: any("did not handshake" in n for n in notes))
@@ -441,9 +440,9 @@ def test_auto_connect_always_probes_the_saved_port(window, monkeypatch) -> None:
         lambda: ["/dev/cu.OddballAdapter", "/dev/cu.usbmodem14201"],
     )
     monkeypatch.setattr(serial_broker, "SerialBroker", _DeafBroker)
-    window.config.serial["port"] = "/dev/cu.OddballAdapter"
+    tab(window).config.serial["port"] = "/dev/cu.OddballAdapter"
     notes: list[str] = []
-    window.bus.subscribe("serial/note", notes.append)
+    tab(window).bus.subscribe("serial/note", notes.append)
 
     window._auto_connect_serial()
     assert drain_until(window, lambda: sum("did not handshake" in n for n in notes) >= 2)

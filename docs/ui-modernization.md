@@ -734,6 +734,76 @@ candidate work item; per-item agent tasks in a future increment.
   still dlopens libGL at all — if not, the probe may shrink instead of grow
   (#16).
 
+## Sorter tabs
+
+**What the change is.** One window now drives several sorting machines at the
+same time, one per tab, like tabs in a browser. The first tab, "All sorters",
+is a dashboard with one row per machine. The full ticket, the options that
+were weighed and the review rulings are in `tasks/multi-sorter-tabs-plan.md`.
+This section records the design decisions that any later change to the UI
+has to respect.
+
+**What a tab owns, and what stays shared.** A tab owns everything that
+belongs to one physical machine: its serial port and speed, its camera, its
+active model, its live slot layouts and active sorting template, its five run
+options, and its run. The model library, Community, themes, sign-in, the
+database and the model folders stay shared, because they describe the
+operator's collection rather than a machine. Sorting template *definitions*
+stay shared per model, so a layout made on one machine can be picked on
+another. Only the choice of which template is in use is per tab.
+
+**One class per machine, and no forwarding from the window.** `SorterTab`
+(`ui/sorter_tab.py`) is the per-machine half of what used to be the window.
+The pages keep their `build_*(host)` factories and are built against the tab
+instead of the window. The window deliberately has no `window.camera` or
+`window.slot_grid` property that forwards to the tab in front. Such a
+property would keep every old call site compiling, and that is exactly the
+problem: a page that should talk to its own machine would silently talk to
+whichever tab happened to be in front, and nothing would flag it. Tests
+therefore name the tab they mean with `tab(window)`.
+
+**One event bus per tab.** The run loop, the serial fan-out, the serial
+monitor and the history panel all post and subscribe to bare topics such as
+`run/result`. Giving every tab its own bus keeps those topics unchanged, and
+it makes cross-talk between machines impossible by construction instead of
+depending on every handler remembering to check a sorter id. Topics that are
+genuinely app-wide (`models/changed`, `community/*`, `sorters/updated`) stay
+on the window's bus. One timer drains every bus, the tab buses first, so a
+dashboard row updates in the same tick as the change it reports.
+
+**Pages are built eagerly.** Each tab's Sort page is built when the tab is
+created, even if nobody ever looks at it, because a background machine's Sort
+page is what counts its cases. A page built on first visit would have missed
+every case sorted before that visit.
+
+**Panels follow the front tab.** The serial monitor and the classification
+history are one panel each rather than one per tab, because a saved panel
+layout that depended on how many tabs exist could not be restored reliably.
+When the operator switches tabs, each panel moves its subscriptions to the
+new tab's bus and replays that tab's buffered lines or records, which is why
+those buffers live on the tab. The panel titles name the tab only when there
+are several tabs. With one tab the window looks exactly as it did before
+tabs existed, which is what an upgraded install requires.
+
+**Devices are claimed.** Two tabs must never open the same serial port or
+camera. Two brokers on one port interleave their commands, and a second
+capture on one camera can open successfully and then deliver garbage. The
+operating system refuses neither reliably, and when it does refuse it cannot
+say which tab holds the device. `ui/device_registry.py` therefore records the
+holder, and every connect path asks it first. The emulated board is exempt
+because it is not a real device.
+
+**Running indicator.** A running tab shows a small dot painted in the
+theme's action colour, with a "Running" tooltip, rather than a text prefix in
+its title. A text prefix would change the tab's width every time a run
+started or stopped, and it would take its colour from the tab bar's text
+rather than from the theme's "go" colour.
+
+**Deliberately unchanged.** Local inference still runs on one shared worker
+thread, so two tabs classifying with local models take turns. That single
+thread exists to keep the GPU's cached algorithm choices warm, and changing it
+without a measurement would be a guess.
+
 ## Decision log
 
 | Date | Decision |
@@ -766,4 +836,5 @@ candidate work item; per-item agent tasks in a future increment.
 | 2026-08-14 | **Row actions reverted; both tables act from a selection-scoped bar** (JL, after living with the experiment above). Models is Delete … Activate with "● ACTIVE" back as the Active column's marker; Community is Remove plus one state-driven primary whose label and role follow the selected row's `installed_state` and the download queue. Only the trigger surface moved: the queue, the `models/changed` state sync, the Includes column and full column sorting all stayed. Net simplification — no item widgets in either table, so nothing has to be rebuilt after a sort or `_pin_ai_row`. |
 | 2026-08-14 | **The Tk UI is retired.** `src/sorter/ui/` (30 modules) and `tests/unit/ui/` (21) are deleted, `--qt`/`CASESORTER_QT` are gone, and `python -m sorter` launches `qtui` unconditionally. PySide6-Essentials + pyside6-qtads move from the `[qt]` extra into the core `dependencies`; the extra is removed. Why now: JL live-tested the Qt UI to parity and Seth approved, and carrying two UIs was costing a drift-pin test, a duplicated palette module, a second CI job and a per-file ty override, none of which buy anything once one of the two is the only one anyone launches. Consequences worth knowing: ty now really type-checks `sorter/qtui/` (it could not resolve PySide6 while the extra was absent from CI — the tree came out at **zero** new diagnostics), the UI tests fold into the normal matrix on `QT_QPA_PLATFORM=offscreen` with **no Xvfb anywhere**, and every matrix leg now downloads the ~80 MB abi3 PySide6 wheel. The `qtui` package is **not** renamed to `ui` in this step; that lands separately so the rename stays reviewable as pure churn. |
 | 2026-08-14 | **`sorter/qtui/` → `sorter/ui/`, `tests/unit/qtui/` → `tests/unit/ui/`** — a separate commit from the retirement above, so the rename reads as pure churn and the substantive change reads on its own. `git mv` for both, so it records as a rename. Two follow-ons were not mechanical: `tests/unit/ui/conftest.py`'s `no_cover` filter matched a hardcoded `"tests/unit/qtui"` and now derives the directory from `__file__` (a stale literal there puts the whole UI suite back under the tracer that segfaults it, silently); and the debugging skill's advice to "confirm with `--no-cov`" turned out to be wrong — that flag leaves pytest-cov loaded with no session and every marked test dies on `AttributeError: 'NoneType' object has no attribute 'pause'`. `pytest -p no:cov -o addopts=-ra` is the working form. |
+| 2026-09-24 | **Sorter tabs**: one window drives several machines, one per tab, with an "All sorters" dashboard first. A tab owns its board, camera, active model, slot layouts, template choice, run options and run; the library, Community, themes and sign-in are shared. Each tab has its own event bus, the window has no properties that forward to the front tab, the panels follow the front tab, and a device registry names the tab holding a port or camera. See "Sorter tabs" above. |
 | 2026-09-29 | **The status bar gets a memory** (issue #112, B4; JL, live testing): every `set_status` line also lands in a 200-entry ring (`message_log.py`, UI-free) that a Messages dock renders in full — right-hand, closed by default like the other supplementary panels, opened from View or by clicking the bar's message. Newest at the bottom, as in the serial monitor. A trailing "…" (or an explicit `progress` mark, for the community download's percentages) makes a line a placeholder the next non-error line replaces, so a run's four per-case steps don't flush the ring every fifty cases; errors always append. Levels are set at the call site (`level=ERROR`, or the `status/error` topic) rather than guessed from the text. Logging: every settled line (not placeholders) goes to `casesorter.log` at DEBUG — a file-only trail of what the operator saw, since the panel is not saved — rather than at WARNING, where it would repeat on stderr the exceptions already logged where they are raised. |

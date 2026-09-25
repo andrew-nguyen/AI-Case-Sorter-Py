@@ -80,7 +80,10 @@ def config(tmp_path: Path):
 
     db = Database(tmp_path / "casesorter.db")
     db.ensure_initialized()
-    yield Config(db).load()
+    from sorter.data.sorters import ensure_default_sorter
+
+    ensure_default_sorter(db)
+    yield Config(db, sorter_id=1).load()
     # Explicit close, or every window teardown surfaces a ResourceWarning
     # once the finalizer actually runs (window_factory deleteLater's).
     db.close()
@@ -113,28 +116,43 @@ def window(window_factory, config):
 def seed_model(config: Any, assignments: dict[str, int], *, name: str = "Test model") -> int:
     """Create a model, activate it, and assign headstamps to slots."""
     from sorter.data.models import Model
-    from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo, SettingsRepo
+    from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo
 
     cartridge = CartridgeRepo(config.db).list()[0]
     model = ModelRepo(config.db).create(Model(name=name, cartridge_id=cartridge.id))
     headstamps = HeadstampRepo(config.db)
     for headstamp, slot in assignments.items():
         headstamps.add(model.id, headstamp, slot)
-    SettingsRepo(config.db).set_active_model_id(model.id)
+    config.set_active_model_id(model.id)
     return model.id
 
 
+def tab(window: Any, index: int = 0) -> Any:
+    """The ``index``-th sorter tab of ``window`` (0 is the first sorter, not the dashboard)."""
+    return window.tabs[index]
+
+
+def _drain(window: Any) -> None:
+    # A main window drains the app bus and every tab's bus; a bare host
+    # (a SorterTab, or a test double) has just the one.
+    drain_all = getattr(window, "drain_all", None)
+    if drain_all is not None:
+        drain_all()
+    else:
+        window.bus.drain()
+
+
 def drain_until(window: Any, predicate: Callable[[], bool], timeout_s: float = 5.0) -> bool:
-    """Pump the bus on this thread until ``predicate`` holds (or time runs out).
+    """Pump the buses on this thread until ``predicate`` holds (or time runs out).
 
     The worker/broker threads post; only the main thread may dispatch, so this
     is the test-side stand-in for the drain QTimer.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        window.bus.drain()
+        _drain(window)
         if predicate():
             return True
         time.sleep(0.01)
-    window.bus.drain()
+    _drain(window)
     return predicate()

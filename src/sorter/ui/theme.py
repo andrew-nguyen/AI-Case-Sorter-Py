@@ -486,6 +486,23 @@ QTabBar::tab:selected {{
     color: {c["text"]};
 }}
 
+/* The sorter tab strip's "+" (app.py `_build_tab_strip`): a flat tool button
+   that reads as part of the strip, lit on hover like a tab. The close buttons
+   inside the tabs share `#tabCloseButton` with the dock tabs above. */
+#newSorterButton {{
+    background: transparent;
+    color: {c["text_muted"]};
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-weight: bold;
+}}
+#newSorterButton:hover {{
+    background-color: {c["bg_card_hover"]};
+    color: {c["text"]};
+    border-color: {c["border"]};
+}}
+
 QPushButton {{
     background-color: {c["accent_dim"]};
     color: {c["text"]};

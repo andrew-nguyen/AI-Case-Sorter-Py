@@ -843,10 +843,9 @@ def test_the_bar_removes_the_installed_copy(window, api, config) -> None:
 
 
 def test_removing_the_active_model_is_refused(window, api, config) -> None:
-    from sorter.data.repository import SettingsRepo
 
     model = make_model(config, "Installed one", community_model_uid="uid-installed", model_version=2)
-    SettingsRepo(config.db).set_active_model_id(model.id)
+    config.set_active_model_id(model.id)
     api.models = [info("uid-installed", name="Installed one", version=2)]
     page = build_page(window, api, auth=FakeAuth())
     page.refresh_auth_state()
@@ -879,7 +878,7 @@ def test_deleting_on_the_models_page_flips_the_community_row(window, api, config
     with config.db.transaction():
         ModelRepo(config.db).delete(model.id)
     window.models_page.refresh()  # any Models-page mutation ends in a refresh
-    window.bus.drain()
+    window.drain_all()
 
     assert cell(page, 0, "State") == STATE_LABELS[STATE_DOWNLOAD]
     assert primary_for(page, 0).text() == ACTION_LABELS[STATE_DOWNLOAD]
@@ -896,7 +895,7 @@ def test_an_install_appearing_flips_the_community_row(window, api, config) -> No
 
     make_model(config, "Range brass", community_model_uid="uid-x", model_version=1)
     window.models_page.refresh()
-    window.bus.drain()
+    window.drain_all()
 
     assert cell(page, 0, "State") == STATE_LABELS[STATE_INSTALLED]
     assert primary_for(page, 0).text() == ACTION_LABELS[STATE_INSTALLED]
@@ -912,7 +911,7 @@ def test_an_older_install_appearing_flips_the_row_to_update(window, api, config)
 
     make_model(config, "Range brass", community_model_uid="uid-x", model_version=1)
     window.models_page.refresh()
-    window.bus.drain()
+    window.drain_all()
 
     assert cell(page, 0, "State") == STATE_LABELS[STATE_UPDATE]
     assert primary_for(page, 0).text() == ACTION_LABELS[STATE_UPDATE]

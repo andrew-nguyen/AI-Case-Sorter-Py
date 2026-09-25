@@ -13,7 +13,7 @@ from sorter.control.events import EventBus
 from sorter.control.run_controller import RunController
 from sorter.data.config import Config
 from sorter.data.db import Database
-from sorter.data.repository import ModelRepo, SettingsRepo
+from sorter.data.repository import ModelRepo
 from sorter.hardware.serial_emulator import EmulatorBroker
 
 
@@ -31,10 +31,9 @@ def _make(tmp_path) -> tuple[RunController, Config, Database]:
     db = Database(tmp_path / "test.db")
     db.ensure_initialized()
     seed = ModelRepo(db).list()[0]
-    SettingsRepo(db).set_active_model_id(seed.id)
-    cfg = Config(db).load()
-    cfg.api["api_key"] = "fake"
-    cfg.save()
+    Config(db, sorter_id=1).set_active_model_id(seed.id)
+    cfg = Config(db, sorter_id=1).load()
+    cfg.save_api({**cfg.api, "api_key": "fake"})
     cfg.add_headstamp("CBC")
     cfg.add_headstamp("FC")
     cfg.set_run_confidence_floor(0)
@@ -68,9 +67,9 @@ def test_first_empty_slot_skips_assigned(tmp_path) -> None:
 def test_first_empty_slot_ignores_other_modes_config(tmp_path) -> None:
     """Auto-select must only consult the slot config for the active mode."""
     _ctrl, cfg, db = _make(tmp_path)
-    from sorter.data.repository import HeadstampParentRepo, SettingsRepo
+    from sorter.data.repository import HeadstampParentRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     assert mid is not None
 
     # A parent assigned to slot 1 (a *parent-mode* configuration) plus a

@@ -26,9 +26,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QHeaderView
 
 from sorter import paths
-from sorter.data.config import Config
 from sorter.data.models import Model
-from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo, SettingsRepo
+from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo
 from sorter.ui.dialog_model_editor import ModelEditorDialog
 from sorter.ui.models_page import (
     ACTIVE_COLUMN,
@@ -44,7 +43,7 @@ from sorter.ui.models_page import (
 )
 from sorter.ui.palettes import THEMES, theme_names
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 
 @pytest.fixture(autouse=True)
@@ -139,7 +138,7 @@ def get_model(config: Any, model_id: int | None) -> Model:
 
 def fresh_active_id(config: Any) -> int | None:
     """The active model as a *second* reader sees it — never the page's copy."""
-    return SettingsRepo(Config(config.db).load().db).get_active_model_id()
+    return config.active_model_id
 
 
 # ----- the library table -----------------------------------------------------
@@ -393,7 +392,7 @@ def test_every_column_sorts_and_toggles_on_a_real_header_click(page, window, con
         trained_image_count=1,
         last_training_date="2024-01-01 08:00",
     )
-    SettingsRepo(config.db).set_active_model_id(alpha.id)
+    config.set_active_model_id(alpha.id)
     page.refresh()
 
     wanted = ("Bravo", "Alpha", "Charlie")
@@ -462,7 +461,7 @@ def test_activate_flips_the_setting_and_posts_mode_changed(page, window, config)
     model = make_model(config, "Range brass")
     page.refresh()
     posted: list[Any] = []
-    window.bus.subscribe("mode/changed", posted.append)
+    tab(window).bus.subscribe("mode/changed", posted.append)
     select(page, model.id)
 
     page.activate_selected()
@@ -905,7 +904,7 @@ def test_export_to_waits_for_the_notification_not_the_archive(page, window, conf
 
     assert window.notify.titles[-1] == "Export complete"
     settled = len(window.notify.calls)
-    window.bus.drain()
+    window.drain_all()
     assert len(window.notify.calls) == settled, "a completion notification was still on the bus"
 
 

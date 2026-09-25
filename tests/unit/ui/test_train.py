@@ -27,7 +27,7 @@ from PySide6.QtWidgets import QListView
 
 from sorter import paths
 from sorter.data.models import TrainingConfig
-from sorter.data.repository import HeadstampRepo, ModelRepo, SettingsRepo
+from sorter.data.repository import HeadstampRepo, ModelRepo
 from sorter.training.dataset import parse_label
 from sorter.ui.dialog_training_config import NUMERIC_FIELDS, TrainingConfigDialog
 from sorter.ui.train_page import (
@@ -40,7 +40,7 @@ from sorter.ui.train_page import (
     UNAVAILABLE_TITLE_FOREIGN,
 )
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 
 @pytest.fixture(autouse=True)
@@ -115,14 +115,14 @@ def _frame() -> np.ndarray:
 @pytest.fixture
 def page(window):
     window.notify = _Recorder()
-    window.camera = _FakeCamera(_frame())
-    return window.train_page
+    tab(window).camera = _FakeCamera(_frame())
+    return tab(window).train_page
 
 
 @pytest.fixture
 def connected(page, window):
     """The page with a board attached, refreshed the way a connect does."""
-    window.broker = _FakeBroker()
+    tab(window).broker = _FakeBroker()
     page.refresh_connection()
     return page
 
@@ -194,8 +194,8 @@ def test_feed_drops_a_case_captures_and_arms_save(connected, window, config) -> 
 
     do_feed(connected, window)
 
-    assert window.broker.slots == [0]  # catch-all: Sort while training is off
-    assert window.camera.captures == 1
+    assert tab(window).broker.slots == [0]  # catch-all: Sort while training is off
+    assert tab(window).camera.captures == 1
     assert connected._last_cropped is not None
     assert connected.save_button.isEnabled()
     assert connected.status_label.text() == CAPTURED_TEXT
@@ -203,11 +203,11 @@ def test_feed_drops_a_case_captures_and_arms_save(connected, window, config) -> 
 
 def test_feed_reports_a_board_timeout_and_captures_nothing(connected, window, config) -> None:
     activate(config)
-    window.broker.ok = False
+    tab(window).broker.ok = False
 
     do_feed(connected, window)
 
-    assert window.camera.captures == 0
+    assert tab(window).camera.captures == 0
     assert connected._last_cropped is None
     assert "timeout" in connected.status_label.text().lower()
 
@@ -220,7 +220,7 @@ def test_sort_while_training_routes_the_case_to_the_labels_slot(connected, windo
     connected.label_combo.setCurrentText("9mm FC")
     do_feed(connected, window)
 
-    assert window.broker.slots == [3]
+    assert tab(window).broker.slots == [3]
     # The toggle is persisted, not just held in the widget.
     assert config.sort_while_training is True
 
@@ -234,7 +234,7 @@ def test_sort_while_training_uses_the_carried_label_not_the_field(connected, win
     connected.label_combo.setCurrentText("9mm FC")
     do_feed(connected, window, sort_label="S&B")
 
-    assert window.broker.slots == [4]
+    assert tab(window).broker.slots == [4]
 
 
 def test_an_unknown_label_falls_through_to_the_catch_all(connected, window, config) -> None:
@@ -245,7 +245,7 @@ def test_an_unknown_label_falls_through_to_the_catch_all(connected, window, conf
     connected.label_combo.setCurrentText("never seen")
     do_feed(connected, window)
 
-    assert window.broker.slots == [0]
+    assert tab(window).broker.slots == [0]
 
 
 # ----- saving ----------------------------------------------------------------
@@ -384,7 +384,7 @@ def test_a_wide_counts_list_shows_multiple_columns_without_scrolling(qapp, windo
     # many rows one column holds follows the platform font, so a fixed count
     # gave Windows CI a single column where Linux overflowed (or vice versa).
     activate(config, _many_headstamps(1))
-    window.train_page.refresh()
+    tab(window).train_page.refresh()
     window.show_page("Train")
     window.resize(1600, 250)
     # Set before the first show(): a splitter resize on an already-shown list
@@ -392,18 +392,18 @@ def test_a_wide_counts_list_shows_multiple_columns_without_scrolling(qapp, windo
     # only the size in place for the first real layout pass is trustworthy.
     # (A model change does relayout, which is what lets the second refresh
     # below take effect.)
-    window.train_page.body_splitter.setSizes([200, 1300])
+    tab(window).train_page.body_splitter.setSizes([200, 1300])
     window.show()
     for _ in range(10):
         qapp.processEvents()
 
-    lst = window.train_page.counts_list
+    lst = tab(window).train_page.counts_list
     cell = lst.visualItemRect(lst.item(0))
     rows_per_column = max(1, lst.viewport().height() // cell.height())
     # Enough to spill into a second column; few enough that two columns of any
     # font's width fit the ~1200px pane.
     activate(config, _many_headstamps(rows_per_column + 2))
-    window.train_page.refresh()
+    tab(window).train_page.refresh()
     for _ in range(10):
         qapp.processEvents()
 
@@ -417,25 +417,25 @@ def test_a_wide_counts_list_shows_multiple_columns_without_scrolling(qapp, windo
 
 def test_a_narrow_counts_list_needs_a_scroll_past_the_first_column(qapp, window, config) -> None:
     activate(config, _many_headstamps(40))
-    window.train_page.refresh()
+    tab(window).train_page.refresh()
     window.show_page("Train")
     window.resize(1600, 250)
-    window.train_page.body_splitter.setSizes([1300, 200])
+    tab(window).train_page.body_splitter.setSizes([1300, 200])
     window.show()
     for _ in range(10):
         qapp.processEvents()
 
-    lst = window.train_page.counts_list
+    lst = tab(window).train_page.counts_list
     assert lst.horizontalScrollBar().maximum() > 0  # later columns exist but aren't all visible
 
 
 def test_dragging_the_splitter_widens_the_list_and_the_scrollbar_follows(qapp, window, config) -> None:
     activate(config, _many_headstamps(40))
-    window.train_page.refresh()
+    tab(window).train_page.refresh()
     window.show_page("Train")
     window.resize(1600, 250)
-    splitter = window.train_page.body_splitter
-    lst = window.train_page.counts_list
+    splitter = tab(window).train_page.body_splitter
+    lst = tab(window).train_page.counts_list
     # Narrow FIRST, set before the first show: only the first layout pass is
     # trustworthy for item geometry offscreen (see the wide test's note), and
     # the narrow state is the one that must prove a scrollbar exists.
@@ -496,7 +496,7 @@ def shown(qapp, window, config):
     window.show()
     for _ in range(10):
         qapp.processEvents()
-    return window.train_page
+    return tab(window).train_page
 
 
 def test_the_sort_toggle_sits_with_the_training_settings(shown) -> None:
@@ -578,7 +578,7 @@ def test_feed_proceeds_without_a_gate_and_says_why_nothing_was_predicted(
 
     do_feed(connected, window)
 
-    assert window.broker.slots == [0]
+    assert tab(window).broker.slots == [0]
     assert connected._last_cropped is not None
     assert connected.status_label.text() == NO_TORCH_TEXT
     assert connected.prediction_label.text() == ""
@@ -604,12 +604,12 @@ def test_the_offer_is_made_through_the_windows_gate_once_per_session(
     assert "PyTorch" in (calls[0]["reason"] or "")
     # A cancel re-enters the feed, which is what makes "no thanks" stick.
     assert calls[0]["on_cancel"] is not None
-    assert window.broker.slots == []  # the feed did not happen
+    assert tab(window).broker.slots == []  # the feed did not happen
 
     do_feed(connected, window)
 
     assert len(calls) == 1  # asked once, never again this session
-    assert window.broker.slots == [0]
+    assert tab(window).broker.slots == [0]
 
 
 def test_a_gate_without_on_cancel_is_still_called(connected, window, config, tmp_path, monkeypatch) -> None:
@@ -627,7 +627,7 @@ def test_a_gate_without_on_cancel_is_still_called(connected, window, config, tmp
     do_feed(connected, window)
 
     assert len(seen) == 1
-    assert window.broker.slots == [0]
+    assert tab(window).broker.slots == [0]
 
 
 def test_no_offer_without_a_checkpoint_to_predict_with(connected, window, config, monkeypatch) -> None:
@@ -681,8 +681,8 @@ def test_ai_config_mode_empties_the_page(page, window, config) -> None:
     page.refresh()
     assert page.counts()
 
-    SettingsRepo(config.db).clear_active_model()
-    window.bus.post("mode/changed", {"active_model_id": None})
+    config.set_active_model_id(None)
+    tab(window).bus.post("mode/changed", {"active_model_id": None})
     assert drain_until(window, lambda: page.counts_list.count() == 0)
 
     assert "AI Config" in page.active_label.text()
@@ -698,7 +698,7 @@ def test_ai_config_mode_explains_why_training_is_unavailable(page, window, confi
     assert "Models page" in page.unavailable_text.text()
 
     activate(config, {"9mm FC": 1})
-    window.bus.post("mode/changed", {"active_model_id": 1})
+    tab(window).bus.post("mode/changed", {"active_model_id": 1})
 
     assert drain_until(window, page.is_available)
 
@@ -723,7 +723,7 @@ def test_the_explainers_button_jumps_to_the_models_page(page, window) -> None:
 
 def test_mode_changed_refreshes_the_active_model(page, window, config) -> None:
     activate(config, {"9mm FC": 1}, name="Range brass")
-    window.bus.post("mode/changed", {"active_model_id": None})
+    tab(window).bus.post("mode/changed", {"active_model_id": None})
 
     assert drain_until(window, lambda: "Range brass" in page.active_label.text())
 

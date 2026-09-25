@@ -62,6 +62,7 @@ _PAGE_TOPICS = {
     "AI Config": "ai-config",
     "Models": "models",
     "Community": "community",
+    "All sorters": "all-sorters",
 }
 
 _SLUG_STRIP_RE = re.compile(r"[^\w\s-]")

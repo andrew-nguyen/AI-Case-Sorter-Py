@@ -11,7 +11,6 @@ from sorter.data.repository import (
     HeadstampParentRepo,
     HeadstampRepo,
     ModelRepo,
-    SettingsRepo,
 )
 
 from ._legacy_db import columns, write_legacy_db
@@ -25,7 +24,7 @@ def _new_db(tmp_path: Path) -> Database:
 
 def _activate_seeded_model(db: Database) -> int:
     seed = ModelRepo(db).list()[0]
-    SettingsRepo(db).set_active_model_id(seed.id)
+    Config(db, sorter_id=1).set_active_model_id(seed.id)
     return seed.id
 
 
@@ -46,23 +45,23 @@ def _seed_parents(db: Database, model_id: int) -> dict[str, int]:
 def test_model_has_parents(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     assert cfg.model_has_parents() is False
     _seed_parents(db, mid)
     assert cfg.model_has_parents() is True
 
     # AI Config mode never has parents.
-    SettingsRepo(db).clear_active_model()
-    assert Config(db).load().model_has_parents() is False
+    Config(db, sorter_id=1).set_active_model_id(None)
+    assert Config(db, sorter_id=1).load().model_has_parents() is False
 
 
 def test_use_parent_flag_is_per_model(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     assert cfg.use_parent_classifications is False
     assert cfg.set_use_parent_classifications(True)
-    assert Config(db).load().use_parent_classifications is True
+    assert Config(db, sorter_id=1).load().use_parent_classifications is True
 
     # A different active model has its own (default-off) flag.
     seeded = ModelRepo(db).get(mid)
@@ -74,12 +73,12 @@ def test_use_parent_flag_is_per_model(tmp_path: Path) -> None:
             model_mode="convnext_tiny",
         )
     )
-    SettingsRepo(db).set_active_model_id(other.id)
-    assert Config(db).load().use_parent_classifications is False
+    Config(db, sorter_id=1).set_active_model_id(other.id)
+    assert Config(db, sorter_id=1).load().use_parent_classifications is False
 
     # AI Config mode: setting is a no-op, reads False.
-    SettingsRepo(db).clear_active_model()
-    cfg = Config(db).load()
+    Config(db, sorter_id=1).set_active_model_id(None)
+    cfg = Config(db, sorter_id=1).load()
     assert cfg.set_use_parent_classifications(True) is False
     assert cfg.use_parent_classifications is False
 
@@ -88,11 +87,11 @@ def test_parent_slot_assignment_and_listing(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
     ids = _seed_parents(db, mid)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
 
     assert cfg.set_parent_slot(ids["Brass"], 1)
     assert cfg.set_parent_slot(ids["Nickle"], 2)
-    by_name = {p["name"]: p for p in Config(db).load().parents_with_slots()}
+    by_name = {p["name"]: p for p in Config(db, sorter_id=1).load().parents_with_slots()}
     assert by_name["Brass"]["slot"] == 1
     assert by_name["Nickle"]["slot"] == 2
 
@@ -105,13 +104,13 @@ def test_routing_uses_parent_slot_when_enabled(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
     ids = _seed_parents(db, mid)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     cfg.set_parent_slot(ids["Brass"], 1)
     cfg.set_parent_slot(ids["Nickle"], 2)
     cfg.set_headstamp_slot("WIN", 3)  # orphan keeps its own slot
     cfg.set_use_parent_classifications(True)
 
-    routed = Config(db).load()
+    routed = Config(db, sorter_id=1).load()
     # Children route to their parent's slot...
     assert routed.slot_for_headstamp("BLZR") == 1
     assert routed.slot_for_headstamp("CBC") == 1
@@ -128,26 +127,26 @@ def test_parent_for_headstamp(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
     _seed_parents(db, mid)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     assert cfg.parent_for_headstamp("BLZR") == "Brass"
     assert cfg.parent_for_headstamp("RP") == "Nickle"
     assert cfg.parent_for_headstamp("WIN") is None  # orphan
     assert cfg.parent_for_headstamp("ZZZ") is None  # unknown
 
-    SettingsRepo(db).clear_active_model()
-    assert Config(db).load().parent_for_headstamp("BLZR") is None  # AI Config mode
+    Config(db, sorter_id=1).set_active_model_id(None)
+    assert Config(db, sorter_id=1).load().parent_for_headstamp("BLZR") is None  # AI Config mode
 
 
 def test_routing_ignores_parents_when_disabled(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     mid = _activate_seeded_model(db)
     ids = _seed_parents(db, mid)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     cfg.set_parent_slot(ids["Brass"], 1)
     # Child has its own (child-mode) slot independent of the parent's slot.
     cfg.set_headstamp_slot("BLZR", 5)
     # Flag off (default): standard per-headstamp routing.
-    routed = Config(db).load()
+    routed = Config(db, sorter_id=1).load()
     assert routed.slot_for_headstamp("BLZR") == 5
 
 

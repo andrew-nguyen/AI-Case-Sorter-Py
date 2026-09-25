@@ -535,7 +535,9 @@ class WinFormsImportDialog(QDialog):
 
         root = self._root
         db = self._win.db
-        config = self._win.config
+        # Serial, image processing and the adopted active model land on the
+        # sorter tab in front; the models and images are shared by every tab.
+        config = self._win.current_tab.config
         events = self._events
 
         def _work() -> None:

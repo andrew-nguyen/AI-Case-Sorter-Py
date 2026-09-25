@@ -25,7 +25,7 @@ from typing import Any
 
 from .. import __version__, paths
 from ..data.models import Model, is_foreign_model
-from ..data.repository import ModelRepo, SettingsRepo
+from ..data.repository import ModelRepo
 from ..hardware import serial_log
 from ..training import manager
 
@@ -54,14 +54,14 @@ def _redact_path(raw: str | None) -> str | None:
         return "(outside data root)"
 
 
-def _active_model(db: Any) -> Model | None:
-    active_id = SettingsRepo(db).get_active_model_id()
+def _active_model(config: Any, db: Any) -> Model | None:
+    active_id = config.active_model_id
     return None if active_id is None else ModelRepo(db).get(active_id)
 
 
 def collect_data(config: Any, db: Any) -> dict[str, Any]:
     """The redacted, machine-readable form of everything the report shows."""
-    model = _active_model(db)
+    model = _active_model(config, db)
     serial = config.serial
     init_settings = dict(serial.get("init_settings") or {})
     image_proc = config.image_proc

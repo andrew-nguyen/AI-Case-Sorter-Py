@@ -21,7 +21,7 @@ from sorter.data.repository import HeadstampParentRepo, HeadstampRepo
 from sorter.ui.dialog_slot_assign import SlotAssignDialog
 from sorter.ui.slot_grid import EMPTY_HINT
 
-from .conftest import seed_model
+from .conftest import seed_model, tab
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def editor(window, config):
 
     def _open(slot: int) -> SlotAssignDialog:
         dialog = SlotAssignDialog(config, slot, window)
-        dialog.changed.connect(window.slot_grid.refresh_assignments)
+        dialog.changed.connect(tab(window).slot_grid.refresh_assignments)
         return dialog
 
     return _open
@@ -38,7 +38,7 @@ def editor(window, config):
 
 def stored_slots(config) -> dict[str, int]:
     """Headstamp -> slot, read back from the DB through a new Config."""
-    return {e["name"]: int(e["slot"]) for e in Config(config.db).load().headstamps}
+    return {e["name"]: int(e["slot"]) for e in Config(config.db, sorter_id=1).load().headstamps}
 
 
 # ----- opening ---------------------------------------------------------------
@@ -46,15 +46,15 @@ def stored_slots(config) -> dict[str, int]:
 
 def test_clicking_a_card_opens_that_slots_editor(window, monkeypatch) -> None:
     opened = []
-    monkeypatch.setattr(window, "open_slot_editor", opened.append)
+    monkeypatch.setattr(tab(window), "open_slot_editor", opened.append)
 
-    QTest.mouseClick(window.slot_grid.cards[3], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(tab(window).slot_grid.cards[3], Qt.MouseButton.LeftButton)
 
     assert opened == [3]
 
 
 def test_the_catch_all_has_nothing_to_configure(window) -> None:
-    window.open_slot_editor(0)
+    tab(window).open_slot_editor(0)
 
     assert "ends up here" in window.statusBar().currentMessage()
 
@@ -79,7 +79,7 @@ def test_an_ampersand_in_a_name_is_shown_and_assigns_the_real_name(window, confi
     box.click()
 
     assert stored_slots(config) == {"S&B 9MM LUGER": 2}
-    assert window.slot_grid.cards[2].names_label.text() == "S&B 9MM LUGER"
+    assert tab(window).slot_grid.cards[2].names_label.text() == "S&B 9MM LUGER"
 
 
 def test_package_mode_assigns_an_ampersand_name_unescaped(config, editor) -> None:
@@ -110,8 +110,8 @@ def test_assigning_moves_a_headstamp_off_its_previous_slot(window, config, edito
     dialog.checkboxes["9mm FC"].click()
 
     assert stored_slots(config) == {"9mm FC": 2}
-    assert window.slot_grid.cards[2].names_label.text() == "9mm FC"
-    assert window.slot_grid.cards[1].names_label.text() == EMPTY_HINT
+    assert tab(window).slot_grid.cards[2].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[1].names_label.text() == EMPTY_HINT
 
 
 def test_a_row_says_which_other_slot_holds_it(config, editor) -> None:
@@ -130,7 +130,7 @@ def test_unticking_returns_a_headstamp_to_the_catch_all(window, config, editor) 
     dialog.checkboxes["9mm FC"].click()
 
     assert stored_slots(config) == {"9mm FC": 0}
-    assert window.slot_grid.cards[2].names_label.text() == EMPTY_HINT
+    assert tab(window).slot_grid.cards[2].names_label.text() == EMPTY_HINT
 
 
 def test_an_edit_lands_in_the_active_sorting_template(config, editor) -> None:
@@ -149,7 +149,7 @@ def test_ai_config_mode_edits_the_settings_backed_headstamps(window, config, edi
     editor(5).checkboxes["9mm RP"].click()
 
     assert stored_slots(config) == {"9mm RP": 5}
-    assert window.slot_grid.cards[5].names_label.text() == "9mm RP"
+    assert tab(window).slot_grid.cards[5].names_label.text() == "9mm RP"
 
 
 # ----- package mode ----------------------------------------------------------
@@ -164,9 +164,9 @@ def test_package_mode_puts_one_headstamp_in_several_slots(window, config, editor
     editor(2).checkboxes[".223 LC"].click()
 
     assert config.slots_for_headstamp_package("9mm FC") == [1, 2]
-    window.slot_grid.refresh_assignments()
-    assert window.slot_grid.cards[1].names_label.text() == "9mm FC"
-    assert window.slot_grid.cards[2].names_label.text() == ".223 LC, 9mm FC"
+    tab(window).slot_grid.refresh_assignments()
+    assert tab(window).slot_grid.cards[1].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[2].names_label.text() == ".223 LC, 9mm FC"
 
 
 def test_package_mode_rows_are_ticked_from_the_package_map(config, editor) -> None:

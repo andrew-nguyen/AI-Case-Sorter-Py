@@ -36,13 +36,12 @@ def _make_controller(tmp_path) -> tuple[RunController, Config, Database]:
     db = Database(tmp_path / "test.db")
     db.ensure_initialized()
     # Activate the auto-seeded model so headstamps have a target.
-    from sorter.data.repository import ModelRepo, SettingsRepo
+    from sorter.data.repository import ModelRepo
 
     seed = ModelRepo(db).list()[0]
-    SettingsRepo(db).set_active_model_id(seed.id)
-    cfg = Config(db).load()
-    cfg.api["api_key"] = "fake"
-    cfg.save()
+    Config(db, sorter_id=1).set_active_model_id(seed.id)
+    cfg = Config(db, sorter_id=1).load()
+    cfg.save_api({**cfg.api, "api_key": "fake"})
     cfg.add_headstamp("WIN", slot=3)
     cfg.add_headstamp("FC", slot=5)
     ctrl = RunController(config=cfg, broker=em, camera=_FakeCamera(), bus=EventBus(), db=db)
@@ -89,9 +88,8 @@ def _run_image_files(model_id):
 def test_store_images_above_floor(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CASESORTER_DATA_DIR", str(tmp_path / "data"))
     ctrl, cfg, db = _make_controller(tmp_path)
-    from sorter.data.repository import SettingsRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     cfg.set_run_confidence_floor(50)
     cfg.set_run_store_images("above")
 
@@ -109,9 +107,8 @@ def test_store_images_above_floor(tmp_path, monkeypatch) -> None:
 def test_store_images_below_floor(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CASESORTER_DATA_DIR", str(tmp_path / "data"))
     ctrl, cfg, db = _make_controller(tmp_path)
-    from sorter.data.repository import SettingsRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     cfg.set_run_confidence_floor(50)
     cfg.set_run_store_images("below")
 
@@ -126,9 +123,8 @@ def test_store_images_below_floor(tmp_path, monkeypatch) -> None:
 def test_store_images_none_and_all(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CASESORTER_DATA_DIR", str(tmp_path / "data"))
     ctrl, cfg, db = _make_controller(tmp_path)
-    from sorter.data.repository import SettingsRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
 
     cfg.set_run_store_images("none")
     with patch("sorter.ml.classifier.classify_active", return_value=("WIN", 90)):
@@ -167,9 +163,9 @@ def test_test_once_skips_sort_step(tmp_path) -> None:
 
 def _link_win_to_brass(db) -> int:
     """Create a Brass parent, link WIN to it, return the parent id."""
-    from sorter.data.repository import HeadstampParentRepo, HeadstampRepo, SettingsRepo
+    from sorter.data.repository import HeadstampParentRepo, HeadstampRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     assert mid is not None
     brass = HeadstampParentRepo(db).add(mid, "Brass")
     win = next(h for h in HeadstampRepo(db).list_for_model(mid) if h.name == "WIN")
@@ -211,9 +207,9 @@ def test_parent_label_omitted_when_mode_disabled(tmp_path) -> None:
 
 def _enable_feedback(db, *, floor=95, mode="Instant") -> int:
     """Turn the active seeded model into a feedback-enabled community model."""
-    from sorter.data.repository import ModelRepo, SettingsRepo
+    from sorter.data.repository import ModelRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     assert mid is not None
     m = ModelRepo(db).get(mid)
     assert m is not None
@@ -257,9 +253,8 @@ def test_feedback_no_capture_for_non_community_model(tmp_path, monkeypatch) -> N
     monkeypatch.setenv("CASESORTER_DATA_DIR", str(tmp_path / "data"))
     ctrl, _, db = _make_controller(tmp_path)  # seeded model is not community
     from sorter.community.feedback import FeedbackService
-    from sorter.data.repository import SettingsRepo
 
-    mid = SettingsRepo(db).get_active_model_id()
+    mid = Config(db, sorter_id=1).active_model_id
     assert mid is not None
     with patch("sorter.ml.classifier.classify_active", return_value=("WIN", 5)):
         ctrl.run_once()

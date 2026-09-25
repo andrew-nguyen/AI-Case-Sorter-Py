@@ -21,7 +21,7 @@ from sorter.data.model_io import (
     read_manifest,
 )
 from sorter.data.models import MODEL_MODES, OPENAI_MODEL_MODE, CheckpointEnv, Model
-from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo, SettingsRepo
+from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo
 
 
 def _seed_db(tmp_path: Path) -> Database:
@@ -572,8 +572,8 @@ def test_community_update_keeps_slots_and_templates(tmp_path: Path) -> None:
         models_target_dir=tmp_path / "mods",
     )
 
-    SettingsRepo(db).set_active_model_id(model_id)
-    config = Config(db).load()
+    Config(db, sorter_id=1).set_active_model_id(model_id)
+    config = Config(db, sorter_id=1).load()
     config.set_headstamp_slot("FC", 3)
     config.set_headstamp_slot("WIN", 5)
     config.create_slot_template("Range brass")
@@ -586,8 +586,8 @@ def test_community_update_keeps_slots_and_templates(tmp_path: Path) -> None:
         models_target_dir=tmp_path / "mods",
     )
 
-    assert SettingsRepo(db).get_active_model_id() == model_id
-    fresh = Config(db).load()
+    assert Config(db, sorter_id=1).active_model_id == model_id
+    fresh = Config(db, sorter_id=1).load()
     assert fresh.slot_for_headstamp("FC") == 3
     assert fresh.slot_for_headstamp("WIN") == 5
     assert fresh.slot_for_headstamp("RP") == 0  # new class: catch-all

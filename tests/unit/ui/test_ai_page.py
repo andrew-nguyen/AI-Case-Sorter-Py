@@ -5,7 +5,7 @@ conftest — every headstamp assertion round-trips through a *second* ``Config``
 on the same DB, because the page reads them fresh on every access.
 
 Nothing here touches the network or a camera: the test-shot tests stub
-``window.camera`` and swap ``api_client``'s module-level session, so the real
+``tab(window).camera`` and swap ``api_client``'s module-level session, so the real
 request is built (rendered prompt, JPEG encoding, bearer key) and inspected
 instead of sent.
 """
@@ -26,19 +26,18 @@ import cv2
 from PySide6.QtWidgets import QLineEdit
 
 from sorter.data.config import Config
-from sorter.data.repository import SettingsRepo
 from sorter.ml import api_client
 from sorter.ui import ai_page
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 
 @pytest.fixture
 def page(window):
     """The page, with modals and the camera stubbed out."""
     window.notify = _Notifier()
-    window.camera = types.SimpleNamespace(capture_frame=lambda: None, latest_frame=lambda: None, stop=lambda: None)
-    return ai_page.build_ai_page(window)
+    tab(window).camera = types.SimpleNamespace(capture_frame=lambda: None, latest_frame=lambda: None, stop=lambda: None)
+    return ai_page.build_ai_page(tab(window))
 
 
 @pytest.fixture
@@ -88,7 +87,7 @@ def _frame() -> np.ndarray:
 
 def _fresh(config: Config) -> Config:
     """A second Config on the same DB — proves a mutation actually persisted."""
-    return Config(config.db).load()
+    return Config(config.db, sorter_id=1).load()
 
 
 def _names(section: ai_page.AiSection) -> list[str]:
@@ -179,13 +178,13 @@ def test_slot_assignment_round_trips(section, config, window) -> None:
 
 def test_slot_change_tells_the_sort_grid(section, window) -> None:
     posted: list[Any] = []
-    window.bus.subscribe("run/assignment_changed", posted.append)
+    tab(window).bus.subscribe("run/assignment_changed", posted.append)
     section.name_edit.setText("9mm")
     section.add_button.click()
     section.list_widget.setCurrentRow(0)
     section.slot_spin.setValue(2)
 
-    window.bus.drain()
+    window.drain_all()
 
     assert len(posted) == 2  # the add, then the slot change
 
@@ -309,7 +308,7 @@ def test_the_form_comes_back_in_ai_config_mode(page, section, config) -> None:
     seed_model(config, {"9mm": 1})
     page.refresh_mode()
 
-    SettingsRepo(config.db).clear_active_model()
+    config.set_active_model_id(None)
     page.refresh_mode()
 
     assert page.is_available()
@@ -339,7 +338,7 @@ def _configure_server(section) -> None:
 def test_test_shot_posts_the_crop_and_shows_the_result(section, window, monkeypatch) -> None:
     session = _Session(_Response(200, {"choices": [{"message": {"content": '"9mm"'}}], "confidence": 0.985}))
     monkeypatch.setattr(api_client, "_session", session)
-    window.camera = types.SimpleNamespace(capture_frame=_frame, latest_frame=lambda: None, stop=lambda: None)
+    tab(window).camera = types.SimpleNamespace(capture_frame=_frame, latest_frame=lambda: None, stop=lambda: None)
     for name in ("9mm", "45acp"):
         section.name_edit.setText(name)
         section.add_button.click()
@@ -380,7 +379,7 @@ def test_test_shot_without_a_frame_reports_it(section, window) -> None:
 
 def test_test_shot_surfaces_a_request_failure(section, window, monkeypatch) -> None:
     monkeypatch.setattr(api_client, "_session", _Session(_Response(500, {"error": "boom"})))
-    window.camera = types.SimpleNamespace(capture_frame=_frame, latest_frame=lambda: None, stop=lambda: None)
+    tab(window).camera = types.SimpleNamespace(capture_frame=_frame, latest_frame=lambda: None, stop=lambda: None)
     _configure_server(section)
 
     section.test_button.click()
@@ -411,7 +410,7 @@ def _seed_openai_model(config: Config, name: str = "HTTP model", **cfg: Any) -> 
     model = ModelRepo(config.db).create(
         Model(name=name, cartridge_id=cart.id, model_mode="openai", ai_model_config=AIModelConfig(**cfg))
     )
-    SettingsRepo(config.db).set_active_model_id(model.id)
+    config.set_active_model_id(model.id)
     return model.id
 
 
@@ -444,7 +443,7 @@ def test_save_writes_to_the_model_row_not_the_app_config(page, window, config) -
     assert saved.ai_model_config.endpoint_url == "http://new-endpoint:8000"
     assert saved.ai_model_config.model == "gpt-5"
     # The app-level config the AI Config mode uses is untouched.
-    assert Config(config.db).load().api["endpoint_url"] == app_endpoint_before
+    assert Config(config.db, sorter_id=1).load().api["endpoint_url"] == app_endpoint_before
 
 
 def test_refresh_keeps_unsaved_edits_while_the_target_is_unchanged(page, window, config) -> None:
@@ -464,7 +463,7 @@ def test_deactivating_rebinds_the_app_level_settings(page, window, config) -> No
     page.refresh_mode()
     assert page.section.endpoint_edit.text() == "http://model-box:9"
 
-    SettingsRepo(config.db).clear_active_model()
+    config.set_active_model_id(None)
     page.refresh_mode()
 
     assert page.is_available()

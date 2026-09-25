@@ -241,7 +241,7 @@ class RunController:
             store = not above_floor
         if not store:
             return
-        model_id = self.config.settings.get_active_model_id()
+        model_id = self.config.active_model_id
         if model_id is None:
             return  # AI Config mode has no per-model folder
         try:
@@ -264,7 +264,7 @@ class RunController:
         """
         if self._feedback is None:
             return []
-        model_id = self.config.settings.get_active_model_id()
+        model_id = self.config.active_model_id
         model = ModelRepo(self.db).get(model_id) if model_id is not None else None
         return self._feedback.refresh_wish_list(model, auth=auth)
 
@@ -329,7 +329,7 @@ class RunController:
                 image_bgr is not None,
             )
             return
-        model_id = self.config.settings.get_active_model_id()
+        model_id = self.config.active_model_id
         if model_id is None:
             log.debug("run-hook: no active model (AI Config mode) — feedback not applicable")
             return
@@ -415,6 +415,7 @@ class RunController:
                 [h["name"] for h in self.config.headstamps if "name" in h],
                 self.config.api,
                 self.db,
+                model_id=self.config.active_model_id,
             )
             result["label"] = label
             result["parent"] = self._parent_label(label)
@@ -496,6 +497,7 @@ class RunController:
                 [h["name"] for h in self.config.headstamps if "name" in h],
                 self.config.api,
                 self.db,
+                model_id=self.config.active_model_id,
             )
             result["label"] = label
             result["parent"] = self._parent_label(label)
@@ -616,6 +618,7 @@ class RunController:
                 [h["name"] for h in self.config.headstamps if "name" in h],
                 self.config.api,
                 self.db,
+                model_id=self.config.active_model_id,
             )
             result["label"] = label
             result["parent"] = self._parent_label(label)

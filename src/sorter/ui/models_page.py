@@ -82,6 +82,8 @@ COLUMNS = ("Model", "Active", "Cartridge", "Type", "Mode", "Images", "Trained", 
 # Breathing room over resizeColumnToContents — see _autosize_columns.
 COLUMN_PADDING = 12
 ACTIVE_MARK = "● ACTIVE"
+# With several sorter tabs the column names the tabs instead: "● Sorter 1, Line B".
+ACTIVE_PREFIX = "● "
 ACTIVE_COLUMN = COLUMNS.index("Active")
 EMPTY_VALUE = "—"
 # GNOME's file-chooser portal strips the parenthesized "(*.zip)" from the
@@ -411,16 +413,17 @@ class ModelsPage(QWidget):
         selected = self.selected_id()
         self._refresh_cartridge_filter()
 
-        active_id = self.settings.get_active_model_id()
+        active_id = self._win.current_tab.config.active_model_id
         cart_by_id = {c.id: c.name for c in self.cartridges.list()}
         counts = image_counts()
+        marks = self._active_marks()
 
         self.tree.clear()
         self._rows = []
         if self._show_ai_row():
-            self._add_ai_row(active_id is None)
+            self._add_ai_row(marks.get(None, ""))
         for model in self._filtered(self.models.list(), cart_by_id):
-            self._add_model_row(model, cart_by_id, counts, active=model.id == active_id)
+            self._add_model_row(model, cart_by_id, counts, active=marks.get(model.id, ""))
 
         self._apply_sort()
         self._restore_selection(selected)
@@ -432,6 +435,21 @@ class ModelsPage(QWidget):
         self._win.bus.post("models/changed", None)
         if announce:
             self._announce_active(active_id)
+
+    def _active_marks(self) -> dict[int | None, str]:
+        """The Active cell per model id (``None`` = AI Config), across every sorter tab.
+
+        The page is shared by every tab, so it can't mean "active on the tab
+        in front". One tab keeps the plain marker it always had; several name
+        each tab the model is active on.
+        """
+        tabs = list(self._win.tabs)
+        names: dict[int | None, list[str]] = {}
+        for tab in tabs:
+            names.setdefault(tab.config.active_model_id, []).append(tab.name)
+        if len(tabs) <= 1:
+            return {key: ACTIVE_MARK for key in names}
+        return {key: ACTIVE_PREFIX + ", ".join(value) for key, value in names.items()}
 
     def _refresh_cartridge_filter(self) -> None:
         names = [FILTER_TYPE_ALL] + [c.name for c in self.cartridges.list()]
@@ -482,7 +500,7 @@ class ModelsPage(QWidget):
     ) -> QTreeWidgetItem:
         item = _SortableItem(values, sort_values, model_id)
         self.tree.addTopLevelItem(item)
-        if values[ACTIVE_COLUMN] == ACTIVE_MARK:
+        if values[ACTIVE_COLUMN]:
             item.setForeground(ACTIVE_COLUMN, self._active_brush())
         self._rows.append((model_id, model))
         return item
@@ -501,19 +519,19 @@ class ModelsPage(QWidget):
         brush = self._active_brush()
         for index in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(index)
-            if item is not None and item.text(ACTIVE_COLUMN) == ACTIVE_MARK:
+            if item is not None and item.text(ACTIVE_COLUMN):
                 item.setForeground(ACTIVE_COLUMN, brush)
 
-    def _add_ai_row(self, active: bool) -> None:
+    def _add_ai_row(self, active: str) -> None:
         item = self._add_row(
-            [AI_CONFIG_NAME, ACTIVE_MARK if active else "", EMPTY_VALUE, "AI Config", "HTTP", "", "", ""],
+            [AI_CONFIG_NAME, active, EMPTY_VALUE, "AI Config", "HTTP", "", "", ""],
             # Typed to match each column's real-row sort values (str.casefold
             # or int) — irrelevant to where this row ends up, since `_pin_ai_row`
             # always pulls it back to index 0 after any sort, but a mismatched
             # type would otherwise trip `_SortableItem.__lt__`'s comparison.
             [
                 AI_CONFIG_NAME.casefold(),
-                ACTIVE_MARK if active else "",
+                active,
                 EMPTY_VALUE.casefold(),
                 "ai config",
                 "http",
@@ -535,7 +553,7 @@ class ModelsPage(QWidget):
         cart_by_id: dict[int, str],
         counts: dict[int, int],
         *,
-        active: bool,
+        active: str,
     ) -> None:
         cartridge_name = cart_by_id.get(model.cartridge_id, EMPTY_VALUE)
         image_count = int(counts.get(model.id, model.trained_image_count))
@@ -543,7 +561,7 @@ class ModelsPage(QWidget):
         self._add_row(
             [
                 model.name,
-                ACTIVE_MARK if active else "",
+                active,
                 cartridge_name,
                 describe_type(model),
                 model_mode_label(model.model_mode),
@@ -553,7 +571,7 @@ class ModelsPage(QWidget):
             ],
             [
                 model.name.casefold(),
-                ACTIVE_MARK if active else "",
+                active,
                 cartridge_name.casefold(),
                 describe_type(model).casefold(),
                 model_mode_label(model.model_mode).casefold(),
@@ -598,7 +616,8 @@ class ModelsPage(QWidget):
         model_id = self.selected_id()
         is_ai_row = model_id == AI_CONFIG_SENTINEL_ID
         model = next((m for row_id, m in self._rows if row_id == model_id), None)
-        active_id = self.settings.get_active_model_id()
+        # Activate acts on the tab in front, so "already active" is that tab's answer.
+        active_id = self._win.current_tab.config.active_model_id
         already_active = (active_id is None) if is_ai_row else (model is not None and model.id == active_id)
         real = model is not None and not self._busy
 
@@ -646,16 +665,12 @@ class ModelsPage(QWidget):
 
     def _activate(self, model: Model | None) -> None:
         """Make ``model`` the active one; ``None`` is AI Config mode."""
-        if model is None:
-            self.settings.clear_active_model()
-            new_active: int | None = None
-        else:
-            self.settings.set_active_model_id(model.id)
-            new_active = model.id
-        # Order matters: headstamps are model-scoped and read fresh, so they
-        # are reloaded before anyone reacts to the mode change.
-        self._win.config.reload_headstamps_for_active_model()
-        self._win.bus.post("mode/changed", {"active_model_id": new_active})
+        new_active = None if model is None else model.id
+        # Activation belongs to the sorter tab in front: its config, and its
+        # bus, which is where that tab's pages listen for mode/changed.
+        tab = self._win.current_tab
+        tab.config.set_active_model_id(new_active)
+        tab.bus.post("mode/changed", {"active_model_id": new_active})
         self.refresh(announce=True)
 
     def _announce_active(self, active_id: int | None) -> None:

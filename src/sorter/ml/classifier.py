@@ -19,6 +19,10 @@ infer on the user's behalf — the switch is theirs to make on the Models tab.
 Note the AI Config tab is hidden while a local model is active, so its
 endpoint isn't even reachable to configure in that state.
 
+"The active model" is always a sorter tab's: each tab picks its own, so every
+entry point here takes the calling tab's `model_id` (`Config.active_model_id`)
+as a required keyword rather than reading a global setting.
+
 `active_model` / `uses_local_inference` / `has_local_checkpoint` expose the
 routing decision on its own so the UI can answer "is this about to need
 PyTorch?" and "can this model actually classify?" *before* starting a run.
@@ -35,7 +39,7 @@ import numpy as np
 from .. import paths
 from ..data.db import Database
 from ..data.models import Model, is_openai_model
-from ..data.repository import ModelRepo, SettingsRepo
+from ..data.repository import ModelRepo
 from . import api_client, local_inference
 
 
@@ -52,21 +56,20 @@ def has_local_checkpoint(model: Model | None) -> bool:
     return bool(model is not None and model.model_path and Path(model.model_path).exists())
 
 
-def active_model(db: Database | None) -> Model | None:
-    """The active model, or None for AI Config mode (classify over HTTP).
+def active_model(db: Database | None, *, model_id: int | None) -> Model | None:
+    """The sorter tab's active model, or None for AI Config mode (classify over HTTP).
 
-    None also covers `db is None` (tests that don't need a database) and a
-    `default_model_id` pointing at a row that no longer exists.
+    `model_id` is the calling tab's active model (`Config.active_model_id`);
+    each sorter tab has its own, so there is no app-wide answer to ask for.
+    None also covers `db is None` (tests that don't need a database) and an id
+    pointing at a row that no longer exists.
     """
-    if db is None:
+    if db is None or model_id is None:
         return None
-    active_id = SettingsRepo(db).get_active_model_id()
-    if active_id is None:
-        return None
-    return ModelRepo(db).get(active_id)
+    return ModelRepo(db).get(model_id)
 
 
-def uses_local_inference(db: Database | None) -> bool:
+def uses_local_inference(db: Database | None, *, model_id: int | None) -> bool:
     """True when classification will run locally — i.e. will need PyTorch.
 
     This is "a local model is active", not "a local model can currently
@@ -77,11 +80,11 @@ def uses_local_inference(db: Database | None) -> bool:
     False for an openai-mode model: it classifies over HTTP, so it needs no
     PyTorch (the torch gate keys off this) and no inference device.
     """
-    model = active_model(db)
+    model = active_model(db, model_id=model_id)
     return model is not None and not is_openai_model(model)
 
 
-def checkpoint_problem(db: Database | None) -> str | None:
+def checkpoint_problem(db: Database | None, *, model_id: int | None) -> str | None:
     """A user-facing explanation of why the active model can't classify.
 
     None when there's nothing wrong — AI Config mode, an openai-mode model
@@ -90,7 +93,7 @@ def checkpoint_problem(db: Database | None) -> str | None:
     the machine feeds a case; `classify_active` raises the same text as a
     backstop for a checkpoint that disappears mid-run.
     """
-    model = active_model(db)
+    model = active_model(db, model_id=model_id)
     # An openai-mode model classifies over HTTP: no checkpoint to find, and
     # no local torch to meet a floor with, so neither check below applies.
     if model is None or is_openai_model(model):
@@ -177,6 +180,8 @@ def classify_active(
     headstamps: list[str],
     api_cfg: dict[str, Any],
     db: Database | None,
+    *,
+    model_id: int | None,
 ) -> tuple[str, float]:
     """Classify `image_bgr` using whichever backend the active model selects.
 
@@ -187,7 +192,7 @@ def classify_active(
     the passed `api_cfg` is deliberately ignored there, so the app-level AI
     Config can never leak into a model that carries its own server settings.
     """
-    model = active_model(db)
+    model = active_model(db, model_id=model_id)
     if model is None:
         return api_client.classify(image_bgr, headstamps, api_cfg)
     if is_openai_model(model):

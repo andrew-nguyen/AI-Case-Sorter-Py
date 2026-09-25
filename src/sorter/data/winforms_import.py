@@ -851,6 +851,7 @@ def _import_ai_config(survey_in: LegacySurvey, config: Config, default_legacy_id
             api["prompt"] = parsed.prompt
         api["image_quality"] = int(parsed.image_quality or api.get("image_quality", 100))
         api["image_scale"] = int(parsed.image_scale or api.get("image_scale", 100))
+        config.save_api(api)
         return True
     return False
 
@@ -966,15 +967,16 @@ def import_installation(
             result.image_processing_imported = _import_image_processing(defaults, config)
         if options.ai_config:
             result.ai_config_imported = _import_ai_config(survey_in, config, activate_legacy_id)
-        if result.serial_imported or result.image_processing_imported or result.ai_config_imported:
+        if result.serial_imported or result.image_processing_imported:
             config.save()
 
-        # Only ever *adopt* the legacy app's active model, never override a
-        # choice already made here — the import is an offer, not a takeover.
-        if imported and settings_repo.get_active_model_id() is None:
+        # Only ever *adopt* the legacy app's active model onto the importing
+        # sorter tab, never override a choice already made there — the import
+        # is an offer, not a takeover.
+        if imported and config.active_model_id is None:
             target = imported.get(activate_legacy_id)
             if target is not None:
-                settings_repo.set_active_model_id(target)
+                config.set_active_model_id(target)
                 result.activated_model_id = target
 
     # ----- file copies, outside the write lock --------------------------------
@@ -1044,9 +1046,10 @@ def _looks_unused(db: Database) -> bool:
     cartridge and model on every fresh database, so the library is never empty.
     What distinguishes a used install is a model the user has actually put to
     work — one with a trained checkpoint on disk — or a deliberate choice of
-    active model. Either means the import offer would be noise.
+    active model on any sorter tab. Either means the import offer would be
+    noise.
     """
-    if SettingsRepo(db).get_active_model_id() is not None:
+    if SettingsRepo(db).active_model_ids():
         return False
     return not any(m.model_path and Path(m.model_path).exists() for m in ModelRepo(db).list())
 

@@ -29,7 +29,7 @@ from sorter.ui.serial_monitor import (
     build_serial_monitor,
 )
 
-from .conftest import drain_until
+from .conftest import drain_until, tab
 
 
 class FakeBroker:
@@ -52,11 +52,11 @@ class FakeBroker:
 
 @pytest.fixture
 def monitor(window) -> SerialMonitorWidget:
-    return build_serial_monitor(window)
+    return build_serial_monitor(tab(window))
 
 
 def post(window, topic: str, payload) -> None:
-    window.bus.post(topic, payload)
+    tab(window).bus.post(topic, payload)
     assert drain_until(window, lambda: True, timeout_s=1.0)
 
 
@@ -118,14 +118,14 @@ def test_zoom_scales_output_and_command_font_proportionally(window, monitor) -> 
 
 
 def test_zoom_persists_and_restores_across_a_rebuilt_monitor(window, config) -> None:
-    first = build_serial_monitor(window)
+    first = build_serial_monitor(tab(window))
     first.zoom_slider.setValue(150)
 
     from sorter.data.repository import SettingsRepo
 
     assert SettingsRepo(config.db).get(SETTING_SERIAL_ZOOM) == "150"
 
-    second = build_serial_monitor(window)
+    second = build_serial_monitor(tab(window))
 
     assert second.zoom_slider.value() == 150
     assert second.output.font().pointSizeF() == pytest.approx(second._base_output_pt * 1.5)
@@ -249,7 +249,7 @@ def test_save_cancelled_writes_nothing(window, monitor, tmp_path: Path, monkeypa
 
 def test_send_command_uses_each_line_ending(window, monitor) -> None:
     broker = FakeBroker()
-    window.broker = broker
+    tab(window).broker = broker
 
     for label, ending in LINE_ENDINGS.items():
         monitor.command_edit.setText("ping")
@@ -260,7 +260,7 @@ def test_send_command_uses_each_line_ending(window, monitor) -> None:
 
 
 def test_send_command_without_a_broker_notes_and_does_not_raise(window, monitor) -> None:
-    window.broker = None
+    tab(window).broker = None
     monitor.command_edit.setText("ping")
 
     monitor.send_command()
@@ -269,7 +269,7 @@ def test_send_command_without_a_broker_notes_and_does_not_raise(window, monitor)
 
 
 def test_command_history_recall_with_up_and_down(window, monitor) -> None:
-    window.broker = FakeBroker()
+    tab(window).broker = FakeBroker()
     for cmd in ("first", "second", "third"):
         monitor.command_edit.setText(cmd)
         monitor.send_command()
@@ -297,27 +297,27 @@ def test_baud_change_persists_and_reconnects(window, monitor, config, monkeypatc
     from sorter.data.config import Config
 
     calls: list[str | None] = []
-    monkeypatch.setattr(window, "connect_serial", lambda port=None: calls.append(port))
-    window.broker = FakeBroker()
-    window.config.serial["port"] = "COM-fake"
+    monkeypatch.setattr(tab(window), "connect_serial", lambda port=None: calls.append(port))
+    tab(window).broker = FakeBroker()
+    tab(window).config.serial["port"] = "COM-fake"
 
     index = monitor.baud_combo.findText("19200")
     assert index >= 0
     monitor.baud_combo.setCurrentIndex(index)
     monitor.baud_combo.activated.emit(index)
 
-    assert Config(config.db).load().serial["baud"] == 19200
+    assert Config(config.db, sorter_id=1).load().serial["baud"] == 19200
     assert calls == ["COM-fake"]
 
 
 def test_baud_unchanged_does_not_reconnect(window, monitor, monkeypatch) -> None:
     calls: list[str | None] = []
-    monkeypatch.setattr(window, "connect_serial", lambda port=None: calls.append(port))
+    monkeypatch.setattr(tab(window), "connect_serial", lambda port=None: calls.append(port))
     # A connected broker already at the configured baud is what makes the
     # short-circuit in `_on_baud_changed` fire — with no broker at all it
     # would fall through (no live speed to compare against) and reconnect
     # regardless.
-    window.broker = FakeBroker()  # baud=9600, matching the fresh config's default
+    tab(window).broker = FakeBroker()  # baud=9600, matching the fresh config's default
     current = str(monitor._configured_baud())
     index = monitor.baud_combo.findText(current)
 
@@ -332,17 +332,17 @@ def test_baud_unchanged_does_not_reconnect(window, monitor, monkeypatch) -> None
 def test_manual_feed_exchange_appears_in_the_widget(window, config, monkeypatch) -> None:
     config.add_headstamp("9mm FC", 2)
     monkeypatch.setattr(classifier, "classify_active", lambda *a, **k: ("9mm FC", 99.0))
-    window.camera = types.SimpleNamespace(
+    tab(window).camera = types.SimpleNamespace(
         capture_frame=lambda: np.zeros((480, 640, 3), np.uint8),
         latest_frame=lambda: None,
         stop=lambda: None,
     )
-    monitor = build_serial_monitor(window)
-    window.connect_serial(EMULATED_PORT)
+    monitor = build_serial_monitor(tab(window))
+    tab(window).connect_serial(EMULATED_PORT)
 
-    window.action_buttons["Manual feed"].click()
+    tab(window).action_buttons["Manual feed"].click()
 
-    assert drain_until(window, lambda: window.slot_grid.cards[2].count_label.text() == "1")
+    assert drain_until(window, lambda: tab(window).slot_grid.cards[2].count_label.text() == "1")
     log = monitor.output.toPlainText()
     assert "-> xf:0" in log
     assert "<- done" in log

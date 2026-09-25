@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Collection
 from typing import TypedDict
 
 import cv2
@@ -357,15 +358,25 @@ def _probe_resolutions(cap: cv2.VideoCapture) -> list[tuple[int, int]]:
     return sorted(supported, key=lambda wh: wh[0] * wh[1])
 
 
-def list_cameras_with_metadata(max_index: int = 10, probe_timeout_s: float = PROBE_TIMEOUT_S) -> list[CameraInfo]:
+def list_cameras_with_metadata(
+    max_index: int = 10,
+    probe_timeout_s: float = PROBE_TIMEOUT_S,
+    *,
+    skip: Collection[int] = (),
+) -> list[CameraInfo]:
     """Enumerate cameras and return [{'index': int, 'name': str, 'resolutions': [(w,h), ...]}].
 
     Resolutions are sorted ascending by pixel count, so `resolutions[-1]` is the
     highest the device accepts among COMMON_RESOLUTIONS.
+
+    ``skip`` names indices that must not be opened at all — a device another
+    part of the app is already streaming from. Probing one opens it, which on
+    V4L2 can disturb the stream that holds it.
     """
     backend = _preferred_backend()
     names = camera_names()
-    candidates = _candidate_indices(max_index)
+    excluded = {int(i) for i in skip}
+    candidates = [i for i in _candidate_indices(max_index) if i not in excluded]
 
     # On Windows, query each device's supported resolutions via DirectShow
     # before any OpenCV capture is opened. The OpenCV DSHOW probe used on

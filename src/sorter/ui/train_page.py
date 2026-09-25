@@ -346,7 +346,7 @@ class TrainPage(QWidget):
     # ----- state --------------------------------------------------------------
 
     def active_model(self) -> Model | None:
-        model_id = self.settings.get_active_model_id()
+        model_id = self.config.active_model_id
         return self.models.get(model_id) if model_id is not None else None
 
     def counts(self) -> dict[str, int]:

@@ -131,7 +131,7 @@ def test_an_unparseable_version_fails_open(monkeypatch) -> None:
 def test_the_sort_preflight_asks_this_too(tmp_path, monkeypatch) -> None:
     """`checkpoint_problem` is what Start calls, so the floor has to reach it."""
     from sorter.data.db import Database
-    from sorter.data.repository import ModelRepo, SettingsRepo
+    from sorter.data.repository import ModelRepo
 
     db = Database(tmp_path / "test.db")
     db.ensure_initialized()
@@ -141,10 +141,9 @@ def test_the_sort_preflight_asks_this_too(tmp_path, monkeypatch) -> None:
     model.model_path = str(checkpoint)
     model.checkpoint_env = CheckpointEnv(torch="2.13.0")
     ModelRepo(db).update(model)
-    SettingsRepo(db).set_active_model_id(model.id)
 
     monkeypatch.setattr(local_inference, "installed_version", lambda: "2.9.1")
-    problem = classifier.checkpoint_problem(db)
+    problem = classifier.checkpoint_problem(db, model_id=model.id)
 
     assert problem is not None and "2.13.0" in problem
 

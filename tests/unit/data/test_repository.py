@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from sorter.data.config import Config
 from sorter.data.db import Database
 from sorter.data.models import Model
 from sorter.data.repository import (
@@ -14,6 +15,7 @@ from sorter.data.repository import (
     ModelRepo,
     SettingsRepo,
 )
+from sorter.data.sorters import create_sorter, ensure_default_sorter
 
 
 def _new_db(tmp_path: Path) -> Database:
@@ -73,37 +75,43 @@ def test_cannot_delete_last_model_in_cartridge(tmp_path: Path) -> None:
         repo.delete(only_model.id)
 
 
-def test_cannot_delete_active_model_without_replacement(tmp_path: Path) -> None:
+def test_cannot_delete_a_model_active_on_any_sorter(tmp_path: Path) -> None:
+    """Deleting a model some tab is sorting with would leave that tab pointing
+    at nothing mid-shift, so the repo refuses and names the tab."""
     db = _new_db(tmp_path)
+    ensure_default_sorter(db)
+    second = create_sorter(db, "Bench")
     repo = ModelRepo(db)
-    settings = SettingsRepo(db)
-    # The seeded model is no longer auto-activated; pick it and activate it
-    # explicitly, then add a sibling so the "last in cartridge" rule does
-    # not pre-empt the active-model rule.
+    # Add a sibling so the "last in cartridge" rule does not pre-empt the
+    # active-model rule.
     seed_model = repo.list()[0]
-    settings.set_active_model_id(seed_model.id)
-    sibling = repo.create(
-        Model(
-            name="sibling",
-            cartridge_id=seed_model.cartridge_id,
-            model_mode="convnext_tiny",
-        )
-    )
-    with pytest.raises(ValueError):
+    repo.create(Model(name="sibling", cartridge_id=seed_model.cartridge_id, model_mode="convnext_tiny"))
+    Config(db, sorter_id=second.id).set_active_model_id(seed_model.id)
+
+    with pytest.raises(ValueError, match="Bench"):
         repo.delete(seed_model.id)
-    repo.delete(seed_model.id, replacement_active_id=sibling.id)
-    assert settings.get_active_model_id() == sibling.id
+    assert repo.get(seed_model.id) is not None
+
+    Config(db, sorter_id=second.id).set_active_model_id(None)
+    repo.delete(seed_model.id)
+    assert repo.get(seed_model.id) is None
 
 
-def test_clear_active_model_returns_to_ai_config_mode(tmp_path: Path) -> None:
+def test_active_model_is_per_sorter(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
-    settings = SettingsRepo(db)
+    ensure_default_sorter(db)
+    second = create_sorter(db)
     seed_model = ModelRepo(db).list()[0]
-    settings.set_active_model_id(seed_model.id)
-    assert settings.get_active_model_id() == seed_model.id
+    first_tab = Config(db, sorter_id=1)
+    first_tab.set_active_model_id(seed_model.id)
 
-    settings.clear_active_model()
-    assert settings.get_active_model_id() is None
+    assert first_tab.active_model_id == seed_model.id
+    assert Config(db, sorter_id=second.id).active_model_id is None
+    assert SettingsRepo(db).active_model_ids() == {seed_model.id}
+
+    first_tab.set_active_model_id(None)
+    assert first_tab.active_model_id is None
+    assert SettingsRepo(db).active_model_ids() == set()
 
 
 def test_headstamp_replace_atomically(tmp_path: Path) -> None:
@@ -154,12 +162,13 @@ def test_find_by_community_uid_prefers_the_active_duplicate(tmp_path: Path) -> N
     dup = repo.find_by_community_uid("uid-dup")
     assert dup is not None and dup.id == first.id
 
-    # Active model wins, whichever duplicate it is.
-    settings = SettingsRepo(db)
-    settings.set_active_model_id(second.id)
+    # A model active on some sorter tab wins, whichever duplicate it is.
+    ensure_default_sorter(db)
+    tab = Config(db, sorter_id=1)
+    tab.set_active_model_id(second.id)
     dup = repo.find_by_community_uid("uid-dup")
     assert dup is not None and dup.id == second.id
-    settings.set_active_model_id(first.id)
+    tab.set_active_model_id(first.id)
     dup = repo.find_by_community_uid("uid-dup")
     assert dup is not None and dup.id == first.id
 

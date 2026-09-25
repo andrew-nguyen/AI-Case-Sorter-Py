@@ -34,7 +34,7 @@ from sorter.ui.history_view import (
     build_history_view,
 )
 
-from .conftest import drain_until
+from .conftest import drain_until, tab
 
 _IMAGE = np.zeros((16, 16, 3), np.uint8)
 
@@ -45,15 +45,15 @@ def history(label: str, confidence: float, slot: int = 1, parent: str | None = N
 
 
 def push(window, view, label: str, confidence: float, slot: int = 1, parent: str | None = None) -> None:
-    window.bus.post("run/history", history(label, confidence, slot, parent))
-    window.bus.drain()
+    tab(window).bus.post("run/history", history(label, confidence, slot, parent))
+    window.drain_all()
 
 
 # ----- empty state -------------------------------------------------------------
 
 
 def test_empty_state_shows_hint_and_hides_the_list(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     assert not view.empty_label.isHidden()
     assert view.grid_area.isHidden()
@@ -61,7 +61,7 @@ def test_empty_state_shows_hint_and_hides_the_list(window) -> None:
 
 
 def test_first_entry_reveals_the_list_and_hides_the_hint(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "9mm FC", 92.0)
 
@@ -73,7 +73,7 @@ def test_first_entry_reveals_the_list_and_hides_the_hint(window) -> None:
 
 
 def test_entries_render_newest_first_with_correct_text(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "9mm", 91.0, slot=1)
     push(window, view, ".223", 82.0, slot=3)
@@ -88,7 +88,7 @@ def test_entries_render_newest_first_with_correct_text(window) -> None:
 
 
 def test_a_parent_classification_prefixes_the_label(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "FC 12", 88.0, parent="9mm")
 
@@ -96,11 +96,11 @@ def test_a_parent_classification_prefixes_the_label(window) -> None:
 
 
 def test_non_dict_payloads_are_ignored(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
-    window.bus.post("run/history", None)
-    window.bus.post("run/history", "not a dict")
-    window.bus.drain()
+    tab(window).bus.post("run/history", None)
+    tab(window).bus.post("run/history", "not a dict")
+    window.drain_all()
 
     assert view._entries == []
 
@@ -111,7 +111,7 @@ def test_non_dict_payloads_are_ignored(window) -> None:
 def test_full_grid_overwrites_the_oldest_cell_in_place(window) -> None:
     """The Windows monitor contract (Seth): tiles never move or scroll — a
     new record overwrites the oldest cell, everything else stays put."""
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     capacity = FALLBACK_COLS * FALLBACK_ROWS
 
     for index in range(capacity):
@@ -129,7 +129,7 @@ def test_full_grid_overwrites_the_oldest_cell_in_place(window) -> None:
 
 
 def test_tiles_fill_top_to_bottom_then_next_column(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     for index in range(FALLBACK_ROWS + 2):
         push(window, view, f"hs{index}", 99.0)
@@ -145,7 +145,7 @@ def test_tiles_fill_top_to_bottom_then_next_column(window) -> None:
 
 
 def test_shrinking_the_view_reflows_and_keeps_the_newest(qapp, window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     view.resize(4 * (TILE_W + GUTTER) + GUTTER, 4 * (TILE_H + GUTTER) + GUTTER)
     view.show()
     qapp.processEvents()
@@ -169,7 +169,7 @@ def test_shrinking_the_view_reflows_and_keeps_the_newest(qapp, window) -> None:
 
 
 def test_every_record_carries_a_running_case_number(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "first", 90.0)
     push(window, view, "second", 91.0)
@@ -182,7 +182,7 @@ def test_every_record_carries_a_running_case_number(window) -> None:
 
 
 def test_case_numbers_survive_a_zoom_replay(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     for index in range(3):
         push(window, view, f"hs{index}", 99.0)
 
@@ -195,7 +195,7 @@ def test_case_numbers_survive_a_zoom_replay(window) -> None:
 
 
 def test_latest_entry_highlight_moves(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     colors = window.palette_colors
 
     push(window, view, "first", 99.0)
@@ -209,7 +209,7 @@ def test_latest_entry_highlight_moves(window) -> None:
 
 
 def test_entries_past_the_snake_carry_no_highlight(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     colors = window.palette_colors
 
     for index in range(len(SNAKE_ROLES) + 2):
@@ -227,7 +227,7 @@ def test_entries_past_the_snake_carry_no_highlight(window) -> None:
 
 def test_below_floor_confidence_colored_warning(window, config) -> None:
     config.set_run_confidence_floor(80)
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "9mm", 92.0)
     push(window, view, "unknown", 41.0)
@@ -239,7 +239,7 @@ def test_below_floor_confidence_colored_warning(window, config) -> None:
 
 def test_a_disabled_floor_never_warns(window, config) -> None:
     config.set_run_confidence_floor(0)
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     push(window, view, "unknown", 3.0)
 
@@ -250,7 +250,7 @@ def test_a_disabled_floor_never_warns(window, config) -> None:
 
 
 def test_clicking_an_entry_opens_the_preview_with_its_record(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm FC", 92.0, slot=2)
     opened = []
     view.open_preview = lambda record: opened.append(record)
@@ -263,7 +263,7 @@ def test_clicking_an_entry_opens_the_preview_with_its_record(window) -> None:
 
 
 def test_preview_dialog_shows_the_record(qapp, window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm FC", 92.0, slot=2, parent="9mm")
 
     dialog = HistoryPreviewDialog(view, view._entries[0].record)
@@ -277,7 +277,7 @@ def test_preview_dialog_shows_the_record(qapp, window) -> None:
 
 
 def test_apply_palette_repaints_after_a_theme_switch(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 99.0)
     before = view._entries[0].styleSheet()
 
@@ -295,7 +295,7 @@ def test_apply_palette_repaints_after_a_theme_switch(window) -> None:
 def test_zoom_bar_sits_below_the_tile_grid(qapp, window) -> None:
     """Seth/JL, 2026-08-13: the zoom bar belongs at the bottom of the dock,
     not above the tiles."""
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     view.resize(400, 400)
     view.show()
     qapp.processEvents()
@@ -308,7 +308,7 @@ def test_zoom_bar_sits_below_the_tile_grid(qapp, window) -> None:
 
 
 def test_zoom_defaults_to_100_percent(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     assert view.zoom_slider.value() == ZOOM_DEFAULT
     assert view.zoom_value_label.text() == "100%"
@@ -318,7 +318,7 @@ def test_zoom_defaults_to_100_percent(window) -> None:
 
 
 def test_zoom_change_scales_tile_footprint_and_thumbnail(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 90.0)
 
     view.zoom_slider.setValue(200)
@@ -336,7 +336,7 @@ def test_zoom_change_scales_tile_footprint_and_thumbnail(window) -> None:
 def test_slider_drag_updates_label_live_without_applying(window) -> None:
     """``sliderMoved`` (drag in progress) only touches the label — the expensive
     tile rebuild waits for ``valueChanged`` (drop), per ``setTracking(False)``."""
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 90.0)
 
     view.zoom_slider.sliderMoved.emit(175)
@@ -347,7 +347,7 @@ def test_slider_drag_updates_label_live_without_applying(window) -> None:
 
 def test_zoom_change_preserves_records_when_capacity_still_fits(window) -> None:
     """Below the fallback grid's capacity, nothing is discarded by a zoom change."""
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 91.0, slot=1)
     push(window, view, ".223", 82.0, slot=3)
     push(window, view, "45 ACP", 77.0, slot=0)
@@ -362,7 +362,7 @@ def test_zoom_change_preserves_records_when_capacity_still_fits(window) -> None:
 
 def test_zoom_in_on_a_fixed_size_widget_shrinks_capacity_and_drops_the_oldest(qapp, window) -> None:
     """Same rule as a plain widget-resize shrink (Seth): newest survive, oldest go."""
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     view.resize(4 * (TILE_W + GUTTER) + GUTTER, 4 * (TILE_H + GUTTER) + GUTTER)
     view.show()
     qapp.processEvents()
@@ -383,11 +383,11 @@ def test_zoom_in_on_a_fixed_size_widget_shrinks_capacity_and_drops_the_oldest(qa
 
 
 def test_zoom_choice_persists_across_view_instances(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     view.zoom_slider.setValue(150)
 
-    second = build_history_view(window)
+    second = build_history_view(tab(window))
     assert second.zoom_slider.value() == 150
     assert second._tile_w == view._tile_w
 
@@ -403,7 +403,7 @@ def test_legacy_percent_sign_value_migrates_on_load(window) -> None:
 
     SettingsRepo(window.db).set(SETTING_HISTORY_ZOOM, "150%")
 
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
 
     assert view.zoom_slider.value() == 150
     assert view.zoom_value_label.text() == "150%"
@@ -411,7 +411,7 @@ def test_legacy_percent_sign_value_migrates_on_load(window) -> None:
 
 
 def test_apply_palette_still_recolors_after_a_zoom_change(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 99.0)
     view.zoom_slider.setValue(150)
 
@@ -425,12 +425,12 @@ def test_apply_palette_still_recolors_after_a_zoom_change(window) -> None:
 
 
 def test_unsubscribe_stops_further_pushes(window) -> None:
-    view = build_history_view(window)
+    view = build_history_view(tab(window))
     push(window, view, "9mm", 99.0)
 
     view.unsubscribe()
-    window.bus.post("run/history", history("after-unsubscribe", 99.0))
-    window.bus.drain()
+    tab(window).bus.post("run/history", history("after-unsubscribe", 99.0))
+    window.drain_all()
 
     assert len(view._entries) == 1
     assert view._entries[0].label_label.text() == "9mm"
@@ -443,15 +443,15 @@ def test_manual_feed_cycle_lands_in_the_history_view(window, config, monkeypatch
     config.add_headstamp("9mm FC", 2)
     monkeypatch.setattr(classifier, "classify_active", lambda *a, **k: ("9mm FC", 97.0))
     # The controller captures the camera it is built with, so stub before connecting.
-    window.camera = types.SimpleNamespace(
+    tab(window).camera = types.SimpleNamespace(
         capture_frame=lambda: np.zeros((480, 640, 3), np.uint8),
         latest_frame=lambda: None,
         stop=lambda: None,
     )
-    view = build_history_view(window)
-    window.connect_serial(EMULATED_PORT)
+    view = build_history_view(tab(window))
+    tab(window).connect_serial(EMULATED_PORT)
 
-    window.action_buttons["Manual feed"].click()
+    tab(window).action_buttons["Manual feed"].click()
 
     assert drain_until(window, lambda: len(view._entries) == 1)
     assert view._entries[0].label_label.text() == "9mm FC"

@@ -459,8 +459,3 @@ class SlotDelegate(QStyledItemDelegate):
         slots = self._dialog.rows[index.row()].slots
         if editor.value() != (slots[0] if slots else 0):
             self._dialog.assign(index.row(), editor.value())
-
-
-def build_headstamp_assign_dialog(win: Any) -> HeadstampAssignDialog:
-    """The dialog over the window's config; the caller wires ``changed`` and opens it."""
-    return HeadstampAssignDialog(win.config, win)

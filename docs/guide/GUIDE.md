@@ -7,6 +7,10 @@ day, in the order you meet them.
 
 - [The window](#the-window) — the activity sidebar, the status bar and the
   menus that frame everything else.
+- [Sorter tabs](#sorter-tabs) — one tab per machine, when you run more than
+  one.
+- [All sorters](#all-sorters) — every machine on one screen, with its own
+  Start/Stop.
 - [Panels](#panels) — the movable side and bottom panels:
   [Serial Monitor](#serial-monitor), [Classification
   History](#classification-history), the guide you are reading,
@@ -39,9 +43,14 @@ section.
 
 ## The window
 
-The window is the same everywhere: a column of activity buttons down the
-left, your working screen in the middle, movable [panels](#panels) around
-it, a menu bar on top and a status bar underneath.
+The window is the same everywhere: a row of [sorter tabs](#sorter-tabs)
+across the top, a column of activity buttons down the left, your working
+screen in the middle, movable [panels](#panels) around it, a menu bar on top
+and a status bar underneath.
+
+With one machine there is one tab, "Sorter 1", and nothing else changes: an
+install from before tabs existed opens as exactly that, with the same port,
+camera, model and bins it had.
 
 ### Activities
 
@@ -69,6 +78,9 @@ at a time — which one follows the **active model** (see [Models](#models)):
 - **a community model** — neither is live: its publisher trained it, and it,
   not a server, does the classifying.
 
+The active model is chosen per [sorter tab](#sorter-tabs), so each tab's
+Train and AI Config follow the model that tab is running.
+
 Hover either button and the tooltip says which of those you are in. A dimmed
 button still works — it is the screen behind it that explains the state, and
 carries a button to the Models page to change it. Never a dead end.
@@ -78,13 +90,14 @@ carries a button to the Models page to change it. Never a dead end.
 Along the bottom, from left to right:
 
 - **Messages** — what the app just did ("Auto-connected to COM3.", "Run
-  stopped."). This is where a refused action explains itself. It shows one
-  line, cut off at the window's edge, until the next replaces it — **click
-  it** to open the [Messages](#messages) panel, which keeps the recent ones
-  in full.
-- **● Camera** and **● Serial** — connection indicators. Green means
-  connected, and the serial one names the port, speed and the firmware
-  version it handshook with.
+  stopped."). This is where a refused action explains itself. With several
+  sorter tabs the message starts with the tab's name. It shows one line, cut
+  off at the window's edge, until the next replaces it — **click it** to open
+  the [Messages](#messages) panel, which keeps the recent ones in full,
+  including those from a tab that is not in front.
+- **● Camera** and **● Serial** — connection indicators for the sorter tab
+  in front. Green means connected, and the serial one names the port, speed
+  and the firmware version it handshook with.
 - **Inference: MPS · Apple M4** (for example) — where classification runs
   when a local model is active: a CUDA GPU, an Apple GPU (MPS), or the CPU,
   with the hardware's name. Appears shortly after startup once the model's
@@ -109,6 +122,79 @@ Along the bottom, from left to right:
 - **Help** holds this guide (`F1`), [Check for updates…](#updates), [Export
   support package…](#support-package), About and License.
 
+## Sorter tabs
+
+Each machine you run gets its own tab in the row across the top of the
+window. A tab owns everything that belongs to one machine:
+
+- its board (serial port and speed) and its camera;
+- its **active model**, and therefore whether its Train or AI Config screen
+  is the live one;
+- its slot layout — which headstamp goes to which bin — and which
+  [sorting template](#sorting-templates) is in use;
+- its run options (confidence floor, package mode, auto-select trays, image
+  storage and Sort While Training);
+- its run: Start, Stop, the counters and the classification history.
+
+The Sort, Train and AI Config screens, and the Camera, Serial and Image
+Processing sections of Settings, show the tab in front. Everything else is
+shared by every tab: the model library, Community, themes, sign-in, and the
+models' training images and templates.
+
+**Every tab keeps running while you look at another one.** A tab that is
+sorting shows a coloured dot next to its name; hover it and it says
+"Running".
+
+**Two tabs on the same model.** Each keeps its own bins, template choice and
+run options. The crop settings in [Settings → Image
+Processing](#image-processing) belong to the model, though, so changing them
+on one tab changes them for every tab running that model. Two tabs that both
+classify with a local model take turns on the computer's one classification
+thread, so each case can take up to twice as long as it does with a single
+machine sorting.
+
+**Adding a machine:** the **+** at the end of the row opens a new tab named
+"Sorter 2" (or the next free number), not connected to anything, on its Sort
+screen. Connect it in [Settings → Serial](#serial) and [Settings →
+Camera](#camera) like the first.
+
+**One device, one tab.** A board or camera another tab is using still appears
+in the list, marked "in use by *tab name*", and can't be picked. Close or
+disconnect it on that tab first. The emulated board is exempt: every tab can
+run its own.
+
+**Renaming:** double-click a tab's name. Names must differ from each other.
+
+**Closing:** the ✕ on a tab. If that tab is connected or sorting, you are
+asked first, and closing stops the run and lets go of its board and camera.
+Closing a tab never deletes a model, an image or a template — those belong to
+the library, not the tab. The last sorter tab can't be closed.
+
+Tabs stay in the order they were made; they can't be dragged. They, and the
+one you were on, come back the next time you start the app, and each one
+reconnects to its own saved board and camera.
+
+## All sorters
+
+The first tab, **All sorters**, shows every machine on one screen, one row
+each, updated as things happen:
+
+| Column | Shows |
+|--------|-------|
+| **Sorter** | The tab's name. Click it to go to that tab. |
+| **Board** | The serial port and whether it is connected. |
+| **Camera** | The camera and whether it is connected. |
+| **Model** | The tab's active model, or "AI Config". |
+| **Run** | Sorting or idle. |
+| **Cases** | Cases sorted in the current run. |
+| **Last result** | The last classification and its confidence, in the confidence colour. |
+| **Last crop** | A thumbnail of the last cropped headstamp. |
+
+Each row ends with a **Start** / **Stop** button. It runs the same checks as
+the Start button on that tab's [Sort dashboard](#sort-dashboard) — a
+connected board, acknowledged moderator notes, a model that can classify —
+and it is greyed out until the tab's board is connected.
+
 ## Panels
 
 Five panels can sit around your working screen. Each one can be moved,
@@ -120,6 +206,10 @@ closed:
 - **User Guide** — on the right, closed by default (this guide).
 - **Themes** — on the right, closed by default.
 - **Messages** — on the right, closed by default.
+
+The Serial Monitor and Classification History show the [sorter
+tab](#sorter-tabs) in front, and switch with it. With several tabs their
+titles name the tab they are showing.
 
 **Moving a panel:** drag it by its *tab* — the small labelled tab at the
 edge of the panel, not its title. As you drag, blue drop indicators appear
@@ -732,7 +822,9 @@ Connects the app to the sorting machine over the board's UART protocol.
   [Serial Monitor](#serial-monitor) shows (each line sent, each line
   received, and the app's own notes) to a file. Each line is timestamped to
   the millisecond. The file is `logs/serial-<date-time>.log` in the data
-  folder (**File → Open data folder**), with one file per session. Ticking or
+  folder (**File → Open data folder**), with one file per session. The
+  setting belongs to the sorter tab whose Serial section you tick it in, so
+  with several sorters you can log just the one you are chasing. Ticking or
   unticking it takes effect immediately, with no restart and no reconnect.
   Leave it off for everyday sorting and turn it on when you are chasing a
   board problem or about to report one. The newest file goes into the

@@ -1,23 +1,32 @@
-"""The PySide6 shell: activity sidebar, stacked pages, docked panels, status bar.
+"""The PySide6 shell: tab strip, activity sidebar, stacked pages, docks, status bar.
 
 This is the app's only UI; ``python -m sorter`` lands here. Every colour comes
 from ``ui/palettes.py``, which ``ui/theme.py`` renders as QSS.
 
-This module owns the shell and the Sort dashboard itself; every other surface
-is its own module with a ``build_*(win)`` factory that this only wires up.
+**Sorter tabs.** Each machine the app drives is a ``SorterTab``
+(``ui/sorter_tab.py``): its own config scope, event bus, camera, serial
+broker, run controller, and its own Sort, Train and AI Config pages and
+Camera / Serial / Image Processing settings sections. The window is what they
+share: one sidebar, one outer page stack, the Models and Community pages,
+the Theme and Import from Windows settings sections, the docks, the status
+bar, sign-in and the database. A per-tab surface is an inner
+``QStackedWidget`` holding every tab's page; bringing a tab to the front
+(``show_tab``) points each inner stack at that tab's page, so switching tabs
+never rebuilds or reparents anything and every background tab keeps running.
+The fixed first tab, "All sorters", is the dashboard (``ui/dashboard_page.py``).
 
 The panels are Qt Advanced Docking System dock widgets (see ``_build_dock``
 and ``DOCK_HOMES``): serial monitor at the bottom, classification history,
 user guide, themes and messages on the right, all but the monitor closed until
-asked for.
-The sidebar+pages are the manager's *central* widget, which is what makes
-them a fixed anchor the panels arrange around rather than a panel themselves.
+asked for. The serial monitor and the history panel follow the front tab
+(``retarget``). The sidebar+pages are the manager's *central* widget, which
+is what makes them a fixed anchor the panels arrange around.
 
-The non-UI layers are used as-is: ``EventBus`` (drained by a 50 ms ``QTimer``
-— workers post, the main thread dispatches), ``Camera``, ``SerialBroker`` and
-``RunController``.
+Every bus (the window's own ``bus`` for models, community, dashboard updates
+and workers, plus one per tab) is drained by a single 50 ms ``QTimer``
+(``drain_all``): workers post, the main thread dispatches.
 
-Scope and rationale: docs/ui-modernization.md.
+Scope and rationale: docs/ui-modernization.md ("Sorter tabs").
 """
 
 from __future__ import annotations
@@ -33,7 +42,6 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
-import numpy as np
 import PySide6QtAds as ads
 from PySide6.QtCore import (
     QByteArray,
@@ -42,54 +50,53 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QUrl,
-    Signal,
 )
 from PySide6.QtGui import (
+    QColor,
     QDesktopServices,
     QGuiApplication,
-    QImage,
+    QIcon,
     QKeySequence,
+    QPainter,
     QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
-    QSplitter,
     QStackedWidget,
+    QTabBar,
     QToolButton,
     QToolTip,
     QVBoxLayout,
     QWidget,
-    QWidgetAction,
 )
 
 from .. import __version__
 from ..control.events import EventBus
-from ..control.run_controller import RunController
-from ..hardware import serial_broker
-from ..hardware.camera import Camera
-from ..hardware.serial_emulator import EMULATED_PORT, EmulatorBroker
-from ..hardware.serial_log import SerialTrafficLog
+from ..data.config import Config
+from ..data.sorters import (
+    create_sorter,
+    delete_sorter,
+    ensure_default_sorter,
+    rename_sorter,
+    set_front_sorter_id,
+)
+from ..hardware.serial_emulator import EMULATED_PORT
 from ..ml import classifier, local_inference
 from ..paths import app_data_dir
-from .ai_page import build_ai_page
 from .community_page import build_community_page
-from .dialog_headstamp_assign import HeadstampAssignDialog, build_headstamp_assign_dialog
-from .dialog_slot_assign import CATCH_ALL_HINT, SlotAssignDialog
-from .dialog_template import EditTemplateDialog, NewTemplateDialog
+from .dashboard_page import DASHBOARD_TITLE, build_dashboard_page
+from .device_registry import DeviceRegistry
 from .dialog_winforms_import import (
     SECTION_NAME as WINFORMS_IMPORT_SECTION,
 )
@@ -113,13 +120,9 @@ from .palettes import (
     theme_names,
 )
 from .serial_monitor import build_serial_monitor
-from .settings_camera import build_camera_section
-from .settings_imageproc import build_imageproc_section
-from .settings_serial import build_serial_section
-from .slot_grid import SlotGrid
+from .sorter_tab import MODEL_UPDATE_BUTTON, TAB_ACTIVITIES, TAB_SETTINGS_SECTIONS, SorterTab
 from .theme import build_stylesheet, unavailable_ink
 from .torch_gate import TorchGate
-from .train_page import build_train_page
 
 log = logging.getLogger(__name__)
 
@@ -160,134 +163,23 @@ SIDEBAR_ICON_SIZE = 26
 # name is also a GUIDE.md heading (help_viewer slugifies section names
 # straight to an anchor, which tests/unit/ui/test_help.py pins).
 SETTINGS_SECTIONS = ("Camera", "Serial", "Image Processing", "Theme", WINFORMS_IMPORT_SECTION)
-BAUD_CHOICES = (9600, 19200, 38400, 57600, 115200)
 # On every dock's tab: QtAds's drop overlays show where a panel *can* go once
 # a drag starts, but nothing hints that it can be dragged at all (JL).
 DOCK_DRAG_HINT = "Drag this tab to move the panel; View \u2192 Re-dock panels brings it home."
 
-# The Sort column's primary panel: the crop the classifier actually saw, plus
-# the one result it produced (Seth, 2026-08-13 — the Windows app's layout).
-# History belongs to the Monitor dock, not to a strip under the dashboard.
-CROP_EMPTY_TEXT = "No case captured yet"
-RESULT_EMPTY_TEXT = "—"
-RESULT_EMPTY_CONFIDENCE = "—"
-CAPTURE_CAPTION = "Last capture"
-HEADSTAMP_CAPTION = "Headstamp"
-CONFIDENCE_CAPTION = "Confidence"
-
-# The live feed is a monitor, not the working surface: off unless asked for,
-# and the preview timer does no camera read while it is (see _refresh_preview).
-SHOW_CAMERA_TEXT = "Show live camera"
-SETTING_SHOW_CAMERA = "ui.sort_show_camera"
-
-# The Start/Stop toggle: one button, two faces. The key is what
-# `action_buttons` exposes it under.
-RUN_TOGGLE_KEY = "Start/Stop"
-RUN_START_TEXT = "Start"
-RUN_STOP_TEXT = "Stop"
-TEMPLATE_BUTTON_WIDTH = 36
-
-# The camera preview when there is nothing to show. The Sort page's version
-# links to where the device is chosen; `_camera_placeholder_html` colors the
-# link from the live palette.
-PREVIEW_INITIAL_TEXT = "No frame"
-CAMERA_DEAD_TEXT = "No camera feed"
-
-
-class _PreviewLabel(QLabel):
-    """The camera preview surface — plain text only, whole-widget click.
-
-    This was a rich-text label with an ``<a>`` link; PySide6 6.11's
-    QTextDocument path crashed the Windows CI runner (offscreen) with a
-    deterministic access violation the first time an event pump touched it.
-    Plain text plus a click signal gives the same affordance without ever
-    instantiating a text document.
-    """
-
-    clicked = Signal()
-
-    def mousePressEvent(self, event: Any) -> None:
-        self.clicked.emit()
-        super().mousePressEvent(event)
-
-
-class _CropPanel(QLabel):
-    """The last cropped headstamp, filling whatever space the column gives it.
-
-    Keeps the source pixmap aside and re-scales on resize: the scaled copy must
-    never become the label's size hint, or each repaint grows the layout the
-    next one is scaled to (same discipline as ``_PreviewLabel``'s host).
-    """
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self._source: QPixmap | None = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.setMinimumSize(1, 1)
-
-    def set_source(self, pixmap: QPixmap) -> None:
-        self._source = pixmap
-        self._rescale()
-
-    def resizeEvent(self, event: Any) -> None:
-        super().resizeEvent(event)
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._source is None or self._source.isNull():
-            return
-        self.setPixmap(
-            self._source.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-
-
-CAMERA_DEAD_LINK = "open Camera settings"
-CAMERA_FAILED_STATUS = "Camera failed to start — pick a device in Settings → Camera."
-
-# Run options, grouped into one popover rather than spread over the page.
-STORE_IMAGES_LABELS = {
-    "none": "None",
-    "above": "Above confidence floor",
-    "below": "Below confidence floor",
-    "all": "All images",
-}
-STORE_IMAGES_BY_LABEL = {label: mode for mode, label in STORE_IMAGES_LABELS.items()}
-STORE_IMAGES_WARNING_TITLE = "Store images enabled"
-STORE_IMAGES_WARNING_TEXT = (
-    "Classified run images will be saved under the active model's run_images "
-    "folder. This can use significant disk space over time."
+# The tab strip. "+" appends a sorter; a running sorter's tab carries a dot in
+# the palette's action role (painted, because no stylesheet reaches one tab).
+NEW_SORTER_TOOLTIP = "Add a sorter (one tab per machine)"
+CLOSE_SORTER_TOOLTIP = "Close this sorter"
+RENAME_TITLE = "Rename sorter"
+RENAME_LABEL = "Sorter name:"
+CLOSE_TITLE = "Close sorter"
+CLOSE_TEXT = (
+    "“{name}” is {state}. Closing it stops the run and disconnects its board and "
+    "camera. Its models and images stay in the library."
 )
-
-# Community model settings (issue #29, A24/A25). The fetch fires on entering
-# Sort with a community model active and is fail-open throughout: anything that
-# goes wrong leaves the local floor, the local opt-in and no prompts.
-MODEL_UPDATE_BUTTON = "Model update: v{version}"
-NOTES_BUTTON = "Moderator notes ({count})"
-FEEDBACK_BLOCKED_STATUS = "Feedback paused by the model's moderator."
-NOTES_GATE_TITLE = "Moderator note"
-NOTES_GATE_TEXT = (
-    "A moderator has left a note about this model's feedback images. "
-    "Read and acknowledge it before starting a run — open it with the "
-    "“Moderator notes” button."
-)
-
-EMPTY_STATE_TITLE = "Nothing connected yet"
-EMPTY_STATE_HINT = "Connect a board and a camera to start sorting."
-
-# A run is stopped, not paused, when the link drops (issue #35): a reconnect
-# mid-cycle leaves the wheel's position and the drop pipeline unknown, and
-# resuming from there is how a case lands in the wrong bin.
-SERIAL_LOST_TITLE = "Serial disconnected"
-SERIAL_LOST_TEXT = (
-    "The board stopped responding, so the run was stopped.\n\n"
-    "Check the cable and the board's power, then reconnect from "
-    "Settings → Serial."
-)
+RUNNING_TAB_TOOLTIP = "Running"
+TAB_MARKER_SIZE = 10
 
 # Persisted window/session state (JL, increment 14): dock layout + the model
 # table's column widths, the same _load_setting/_save_setting pattern used
@@ -332,36 +224,34 @@ def _configure_dock_manager() -> None:
 
 class QtMainWindow(QMainWindow):
     def __init__(self, config: Any, *, auto_connect: bool = True) -> None:
+        """Build the shell and one tab per saved sorter.
+
+        ``config`` is the front sorter's ``Config`` (``__main__`` builds it);
+        every other tab loads its own. Nothing here forwards to the front tab:
+        a caller that means a sorter says which (``current_tab``, ``tabs``).
+        """
         super().__init__()
-        self.config = config
-        self.db = getattr(config, "db", None)
+        self.db = config.db
+        # The app bus: models/changed, community/*, sorters/updated, status,
+        # and every run_worker result. Each tab has its own bus for the rest.
         self.bus = EventBus()
         self._worker_tokens = itertools.count()
         self._muted_labels: list[QLabel] = []
-        # Set before the UI is built: the action row's enabled state reads them.
-        self.broker: Any | None = None
-        self.run_controller: RunController | None = None
-        self._is_running = False
-        self._master_count = 0
-        self._templates: list[Any] = []
-        self.headstamp_assign_dialog: HeadstampAssignDialog | None = None
-        # The current case only — (display label, confidence, above the floor).
-        self._current_result: tuple[str, float, bool] | None = None
-        # The store-images disk-usage notice shows once per session, not per run.
-        self._store_warning_shown = False
-        # Community model settings, from the last Sort-page fetch (A24/A25).
-        # `_community_settings` is kept so a serial reconnect — which builds a
-        # fresh RunController, and with it a fresh FeedbackService — doesn't
-        # silently drop the server's policy.
-        self._settings_fetch_busy = False
-        self._community_settings: tuple[int, Any] | None = None
-        self._model_update: tuple[str, int, int, Any] | None = None
-        # Modal seams (CLAUDE.md §5): instance attributes, so a test replaces
-        # them and nothing blocks offscreen.
-        self.open_notes_dialog: Callable[[], None] = self._open_notes_dialog
-        self.open_model_update_dialog: Callable[[], None] = self._open_model_update_dialog
+        self.tabs: list[SorterTab] = []
+        self._close_buttons: dict[int, QToolButton] = {}
+        # False until the tab strip exists; a tab's construction reports its
+        # state before there is anywhere to show it.
+        self._shell_ready = False
+        # The activity a sorter tab shows; kept while the dashboard is in front.
+        self._activity = "Sort"
+        self.devices = DeviceRegistry(name_of=self._sorter_name)
         # Before _build_ui: set_status records into it from the first page on.
         self.status_log = MessageLog()
+
+        # Modal seams (CLAUDE.md §5): instance attributes, so a test replaces
+        # them and nothing blocks offscreen.
+        self.ask_text: Callable[[str, str, str], str | None] = self._ask_text
+        self.confirm_close_tab: Callable[[SorterTab], bool] = self._confirm_close_tab
 
         self.setMinimumSize(*MIN_WINDOW_SIZE)
 
@@ -369,16 +259,16 @@ class QtMainWindow(QMainWindow):
         self.theme_name = resolve_theme(self._load_setting(SETTING_THEME))
         self.palette_colors = THEMES[self.theme_name]
 
-        # Before _build_ui: the Camera settings page reads it at construction.
-        # Constructing a Camera does not open the device.
-        self.camera = Camera(
-            device_index=int(config.camera.get("device_index", 0)),
-            width=int(config.camera.get("width", 640)),
-            height=int(config.camera.get("height", 480)),
-        )
-
         # The one sanctioned front door for anything needing local inference.
         self.ensure_torch = TorchGate(self)
+
+        # Before the shell: every tab builds its own pages, which read the
+        # palette, the torch gate and the device registry above.
+        roster = ensure_default_sorter(self.db)
+        for record in roster:
+            cfg = config if record.id == config.sorter_id else Config(self.db, sorter_id=record.id).load()
+            self.tabs.append(SorterTab(self, cfg, record.name))
+        self.current_tab = next((t for t in self.tabs if t.sorter_id == config.sorter_id), self.tabs[0])
 
         self.setWindowTitle(f"AI Case Sorter OSS - v{__version__} · GPL-3.0")
         # The headstamp mark, in one fixed neutral (see icons.APP_ICON_COLOR):
@@ -391,39 +281,18 @@ class QtMainWindow(QMainWindow):
         self._apply_theme(self.theme_name)
         self._restore_window_state()
 
+        # community_page posts "status" on the app bus.
         self.bus.subscribe("status", self.set_status)
         self.bus.subscribe("status/error", lambda msg: self.set_status(msg, level=ERROR))
         self.bus.subscribe("status/progress", lambda msg: self.set_status(msg, progress=True))
-        # Run state comes from the controller's own events, never from the
-        # button handlers — a run can also end on its own (error, package halt).
-        self.bus.subscribe("run/started", lambda _p: self._on_run_started())
-        self.bus.subscribe("run/stopped", lambda _p: self._on_run_stopped())
-        self.bus.subscribe("run/status", self.set_status)
-        # Manual feed / test cycles report on their own topic; without this
-        # their progress is invisible and the previous status looks stuck.
-        self.bus.subscribe("test/status", self.set_status)
-        self.bus.subscribe("run/error", lambda msg: self.set_status(f"Run error: {msg}", level=ERROR))
-        self.bus.subscribe("test/error", lambda msg: self.set_status(f"Test error: {msg}", level=ERROR))
-        self.bus.subscribe("run/result", self._on_run_result)
-        # Both fire right after classify_active — the moment the inference
-        # device is guaranteed to have been picked.
-        self.bus.subscribe("run/classified", lambda _p: self.refresh_device_indicator())
-        self.bus.subscribe("test/classified", lambda _p: self.refresh_device_indicator())
-        self.bus.subscribe("run/history", self._on_run_history)
-        self.bus.subscribe("run/assignment_changed", lambda _p: self._refresh_sort_grid())
-        self.bus.subscribe("run/package_full", self._on_package_full)
-        self.bus.subscribe("run/package_halt", self._on_package_halt)
-        self.bus.subscribe("run/out_of_brass", self._on_out_of_brass)
-        self.bus.subscribe("serial/disconnected", self._on_serial_disconnected)
-        # Headstamps, templates and the Train activity are all scoped to the
-        # active model, so a mode switch re-reads every one of them.
-        self.bus.subscribe("mode/changed", lambda _p: self._on_mode_changed())
         self._bus_timer = QTimer(self)
-        self._bus_timer.timeout.connect(lambda: self.bus.drain(max_items=128))
+        self._bus_timer.timeout.connect(self.drain_all)
         self._bus_timer.start(50)
 
+        # One live feed at a time: the front tab's. Background cameras keep
+        # grabbing; nobody is looking at their frames.
         self._preview_timer = QTimer(self)
-        self._preview_timer.timeout.connect(self._refresh_preview)
+        self._preview_timer.timeout.connect(lambda: self.current_tab.refresh_preview())
         self._preview_timer.start(int(1000 / PREVIEW_FPS))
 
         self.auth: Any | None = None
@@ -440,8 +309,9 @@ class QtMainWindow(QMainWindow):
                 self.auth = None
             self.community_page.refresh_auth_state()
             # The shell opens on Sort, so nothing would otherwise "enter" it.
-            self._fetch_community_settings()
-            self.start_camera()
+            self.current_tab.enter_sort()
+            for tab in self.tabs:
+                tab.start_camera()
             self._auto_connect_serial()
             self._warm_device_indicator()
             QTimer.singleShot(2500, self, self._startup_update_check)
@@ -453,41 +323,47 @@ class QtMainWindow(QMainWindow):
     # ----- construction -------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Set before any page is built: show_page("Sort") (from the sidebar's
-        # own construction, below) already reaches _update_sort_empty_state.
-        self._camera_state = ("Camera: disconnected", False)
-        self._serial_state = ("Serial: disconnected", False)
         # Built here rather than with the rest of the status bar (below): the
         # sidebar's own construction enters the Sort page, which paints it.
-        # Same quiet role as the app-update button — it appears only when the
-        # Sort-page fetch found a newer published version.
+        # Same quiet role as the app-update button: it appears only when the
+        # front tab's Sort-page fetch found a newer published version.
         self.model_update_button = QPushButton(self)
         self.model_update_button.setObjectName("update")
-        self.model_update_button.clicked.connect(lambda: self.open_model_update_dialog())
+        self.model_update_button.clicked.connect(lambda: self.current_tab.open_model_update_dialog())
         self.model_update_button.hide()
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addLayout(self._build_tab_strip(central))
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         self.pages = QStackedWidget(central)
         self._pages_by_name: dict[str, QWidget] = {}
-        self._add_page("Sort", self._build_sort_page())
-        self._add_page("Train", self._build_train_page())
-        self._add_page(AI_CONFIG_ACTIVITY, self._build_ai_page())
+        # Per-tab surfaces: one inner stack each, holding every tab's page.
+        self.tab_stacks: dict[str, QStackedWidget] = {
+            name: QStackedWidget() for name in (*TAB_ACTIVITIES, *TAB_SETTINGS_SECTIONS)
+        }
+        for tab in self.tabs:
+            self._add_tab_pages(tab)
+        self._show_tab_pages(self.current_tab)
+        for name in TAB_ACTIVITIES:
+            self._add_page(name, self.tab_stacks[name])
         self._add_page("Models", self._build_models_page())
         self._add_page("Community", self._build_community_page())
         self._add_page("Settings", self._build_settings_page())
+        self.dashboard_page = build_dashboard_page(self)
+        self._add_page(DASHBOARD_TITLE, self.dashboard_page)
         body.addWidget(self._build_sidebar())
         body.addWidget(self.pages, 1)
         layout.addLayout(body, 1)
 
         # QtAds owns the docking; the manager installs itself as the window's
-        # central widget, and the sidebar+pages become *its* central area — a
-        # fixed, unclosable, undraggable anchor the panels arrange around.
+        # central widget, and the tabs+sidebar+pages become *its* central
+        # area: a fixed, unclosable, undraggable anchor the panels arrange
+        # around.
         _configure_dock_manager()
         self.dock_manager = ads.CDockManager(self)
         self.central_dock = ads.CDockWidget(self.dock_manager, "Workspace")
@@ -514,18 +390,17 @@ class QtMainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.camera_label)
         self.statusBar().addPermanentWidget(self.serial_label)
         # Rightmost pair: update affordance (hidden until there is something to
-        # do — the Help menu is the always-reachable route), then sign-in.
+        # do; the Help menu is the always-reachable route), then sign-in.
         self.update_button = QPushButton(self)
         self.update_button.setObjectName("update")
         self.update_button.clicked.connect(lambda: self.open_update_dialog())
         self.update_button.hide()
         self.statusBar().addPermanentWidget(self.update_button)
         self.statusBar().addPermanentWidget(self.model_update_button)
-        # Community identity — the only surface for it now (JL): the
+        # Community identity, the only surface for it now (JL): the
         # Community page used to carry its own "Signed in as ... [Sign out]"
-        # row, which duplicated this button and wasted a row for nothing else
-        # the page needed. Hidden until signed in; text/tooltip filled by
-        # _apply_auth_visibility.
+        # row, which duplicated this button. Hidden until signed in;
+        # text/tooltip filled by _apply_auth_visibility.
         self.identity_label = self._muted_label("", self)
         self.identity_label.hide()
         self.statusBar().addPermanentWidget(self.identity_label)
@@ -536,9 +411,300 @@ class QtMainWindow(QMainWindow):
         # so a click on it reaches only the bar (see eventFilter).
         self._status_bar = self.statusBar()
         self._status_bar.installEventFilter(self)
+        self._shell_ready = True
+        self._retitle_docks()
         self._paint_indicators()
+        self._paint_model_update_button()
+        for tab in self.tabs:
+            self._paint_tab_marker(tab)
         self._apply_mode_visibility()
         self.set_status("Idle.")
+
+    # ----- tab strip ------------------------------------------------------------
+
+    def _build_tab_strip(self, parent: QWidget) -> QHBoxLayout:
+        """ "All sorters" first, then one tab per sorter, then "+".
+
+        Not movable: the dashboard is fixed first and the roster order is the
+        order tabs were created in. Close buttons are ours rather than
+        ``tabsClosable``'s, so the last sorter's can be hidden and brought
+        back without Qt deleting it; ``#tabCloseButton`` gives them the same
+        icon as a dock tab's.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(4, 4, 4, 0)
+        row.setSpacing(4)
+        self.tab_bar = QTabBar(parent)
+        self.tab_bar.setObjectName("sorterTabs")
+        self.tab_bar.setMovable(False)
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.setIconSize(QSize(TAB_MARKER_SIZE, TAB_MARKER_SIZE))
+        self.tab_bar.addTab(DASHBOARD_TITLE)
+        for tab in self.tabs:
+            self._append_tab_bar_entry(tab)
+        self._update_close_buttons()
+        self.tab_bar.setCurrentIndex(self.tabs.index(self.current_tab) + 1)
+        # Connected last: seeding the current index is not the user switching.
+        self.tab_bar.currentChanged.connect(self._on_tab_bar_changed)
+        self.tab_bar.tabBarDoubleClicked.connect(self._on_tab_double_clicked)
+        row.addWidget(self.tab_bar)
+        self.new_sorter_button = QToolButton(parent)
+        self.new_sorter_button.setObjectName("newSorterButton")
+        self.new_sorter_button.setText("+")
+        self.new_sorter_button.setToolTip(NEW_SORTER_TOOLTIP)
+        self.new_sorter_button.clicked.connect(self.new_sorter)
+        row.addWidget(self.new_sorter_button)
+        row.addStretch(1)
+        return row
+
+    def _append_tab_bar_entry(self, tab: SorterTab) -> None:
+        index = self.tab_bar.addTab(tab.name)
+        button = QToolButton(self.tab_bar)
+        button.setObjectName("tabCloseButton")
+        button.setToolTip(CLOSE_SORTER_TOOLTIP)
+        button.clicked.connect(lambda _checked=False, t=tab: self.close_tab(t))
+        self.tab_bar.setTabButton(index, QTabBar.ButtonPosition.RightSide, button)
+        self._close_buttons[tab.sorter_id] = button
+
+    def _update_close_buttons(self) -> None:
+        """The last sorter can't be closed, so its tab offers no close button."""
+        closable = len(self.tabs) > 1
+        for button in self._close_buttons.values():
+            button.setVisible(closable)
+
+    def _sorter_name(self, sorter_id: int) -> str:
+        return next((t.name for t in self.tabs if t.sorter_id == sorter_id), f"Sorter {sorter_id}")
+
+    def tab_index(self, tab: SorterTab) -> int:
+        """The tab strip index of a sorter (0 is "All sorters")."""
+        return self.tabs.index(tab) + 1
+
+    def _on_tab_bar_changed(self, index: int) -> None:
+        if index <= 0:
+            self._show_dashboard()
+        elif index - 1 < len(self.tabs):
+            self.show_tab(self.tabs[index - 1])
+
+    def _on_tab_double_clicked(self, index: int) -> None:
+        if index >= 1:
+            self.rename_tab(self.tabs[index - 1])
+
+    def dashboard_showing(self) -> bool:
+        return self.pages.currentWidget() is self.dashboard_page
+
+    def _show_dashboard(self) -> None:
+        if self.tab_bar.currentIndex() != 0:
+            blocked = self.tab_bar.blockSignals(True)
+            self.tab_bar.setCurrentIndex(0)
+            self.tab_bar.blockSignals(blocked)
+        self.pages.setCurrentWidget(self.dashboard_page)
+        self.dashboard_page.refresh()
+        # No sidebar entry is "where you are" on the dashboard.
+        self._sidebar_group.setExclusive(False)
+        for button in self.sidebar_buttons.values():
+            button.setChecked(False)
+        self._sidebar_group.setExclusive(True)
+
+    def show_tab(self, tab: SorterTab) -> None:
+        """Bring a sorter tab to the front, on the activity last shown."""
+        index = self.tab_index(tab)
+        if self.tab_bar.currentIndex() != index:
+            blocked = self.tab_bar.blockSignals(True)
+            self.tab_bar.setCurrentIndex(index)
+            self.tab_bar.blockSignals(blocked)
+        self._make_front(tab)
+        button = self.sidebar_buttons.get(self._activity)
+        if button is not None:
+            button.setChecked(True)
+        self.show_page(self._activity)
+
+    def _make_front(self, tab: SorterTab) -> None:
+        """Point every shared surface at ``tab``: stacks, docks, status bar."""
+        if tab is self.current_tab:
+            return
+        self.current_tab = tab
+        self._show_tab_pages(tab)
+        set_front_sorter_id(self.db, tab.sorter_id)
+        self.serial_monitor.retarget(tab)
+        self.history_view.retarget(tab)
+        self._retitle_docks()
+        self._paint_indicators()
+        self._paint_model_update_button()
+        self._apply_mode_visibility()
+        self.refresh_device_indicator()
+        # Replayed, not re-recorded: the Messages panel already has this line.
+        self.statusBar().showMessage(self._tab_status_text(tab, tab.last_status))
+
+    def _add_tab_pages(self, tab: SorterTab) -> None:
+        for name, page in tab.pages.items():
+            self.tab_stacks[name].addWidget(page)
+
+    def _show_tab_pages(self, tab: SorterTab) -> None:
+        for name, stack in self.tab_stacks.items():
+            stack.setCurrentWidget(tab.pages[name])
+
+    def new_sorter(self) -> SorterTab:
+        """ "+": a new, unconnected sorter, opened on its Sort page."""
+        record = create_sorter(self.db)
+        tab = SorterTab(self, Config(self.db, sorter_id=record.id).load(), record.name)
+        self.tabs.append(tab)
+        self._add_tab_pages(tab)
+        self._append_tab_bar_entry(tab)
+        self._update_close_buttons()
+        self._retitle_docks()
+        self.dashboard_page.rebuild()
+        self._activity = "Sort"
+        self.show_tab(tab)
+        return tab
+
+    def rename_tab(self, tab: SorterTab) -> None:
+        """Double-click on a title. Names are unique; the data layer says why not."""
+        name = self.ask_text(RENAME_TITLE, RENAME_LABEL, tab.name)
+        if name is None or not name.strip() or name.strip() == tab.name:
+            return
+        try:
+            record = rename_sorter(self.db, tab.sorter_id, name)
+        except ValueError as exc:
+            self.notify(RENAME_TITLE, str(exc))
+            return
+        tab.rename(record.name)
+        self._paint_tab_marker(tab)
+        self._retitle_docks()
+        self.dashboard_page.rebuild()
+
+    def close_tab(self, tab: SorterTab) -> bool:
+        """Close one sorter: stop it, give its devices back, forget its settings.
+
+        Never touches the model library or any image folder: those are
+        shared, and a model active here may be active on another tab.
+        """
+        if tab not in self.tabs or len(self.tabs) <= 1:
+            return False
+        if (tab.broker is not None or tab.is_running) and not self.confirm_close_tab(tab):
+            return False
+        tab.shutdown()
+        try:
+            delete_sorter(self.db, tab.sorter_id)
+        except ValueError as exc:
+            self.notify(CLOSE_TITLE, str(exc))
+            return False
+        index = self.tabs.index(tab)
+        was_front = tab is self.current_tab
+        self.tabs.remove(tab)
+        blocked = self.tab_bar.blockSignals(True)
+        self.tab_bar.removeTab(index + 1)
+        self.tab_bar.blockSignals(blocked)
+        self._close_buttons.pop(tab.sorter_id, None)
+        self._update_close_buttons()
+        if was_front:
+            successor = self.tabs[min(index, len(self.tabs) - 1)]
+            if self.dashboard_showing():
+                self._make_front(successor)
+            else:
+                self.show_tab(successor)
+        for name, page in tab.pages.items():
+            self.tab_stacks[name].removeWidget(page)
+            page.deleteLater()
+        tab.deleteLater()
+        self._retitle_docks()
+        self.dashboard_page.rebuild()
+        return True
+
+    def _confirm_close_tab(self, tab: SorterTab) -> bool:
+        state = "running" if tab.is_running else "connected"
+        answer = QMessageBox.question(
+            self,
+            CLOSE_TITLE,
+            CLOSE_TEXT.format(name=tab.name, state=state),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _ask_text(self, title: str, label: str, current: str) -> str | None:
+        text, ok = QInputDialog.getText(self, title, label, text=current)
+        return text if ok else None
+
+    def _paint_tab_marker(self, tab: SorterTab) -> None:
+        index = self.tab_index(tab)
+        self.tab_bar.setTabText(index, tab.name)
+        if tab.is_running:
+            self.tab_bar.setTabIcon(index, self._running_marker())
+            self.tab_bar.setTabToolTip(index, RUNNING_TAB_TOOLTIP)
+        else:
+            self.tab_bar.setTabIcon(index, QIcon())
+            self.tab_bar.setTabToolTip(index, "")
+
+    def _running_marker(self) -> QIcon:
+        """A dot in the action role, painted, since an icon is out of QSS's reach."""
+        size = TAB_MARKER_SIZE
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self.palette_colors["action"]))
+        painter.drawEllipse(1, 1, size - 2, size - 2)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _retitle_docks(self) -> None:
+        """The two docks that follow the front tab say which one, once there are several."""
+        suffix = f" — {self.current_tab.name}" if len(self.tabs) > 1 else ""
+        for dock, title in ((self.serial_dock, "Serial Monitor"), (self.history_dock, "Classification History")):
+            dock.setWindowTitle(title + suffix)
+            # The View menu names the panel, not the sorter.
+            dock.toggleViewAction().setText(title)
+
+    # ----- what a tab asks of the window --------------------------------------------
+
+    def on_tab_changed(self, tab: SorterTab) -> None:
+        """A tab's run, device or result state moved (``SorterTab._changed``)."""
+        if not self._shell_ready or tab not in self.tabs:
+            return
+        self._paint_tab_marker(tab)
+        if tab is self.current_tab:
+            self._paint_indicators()
+            self._paint_model_update_button()
+        self.bus.post("sorters/updated", tab.sorter_id)
+
+    def on_tab_mode_changed(self, tab: SorterTab) -> None:
+        """A tab's active model changed: the shared surfaces that show it follow."""
+        if not self._shell_ready:
+            return
+        if tab is self.current_tab:
+            self._apply_mode_visibility()
+            self.refresh_device_indicator()
+        # The library's Active column names every tab a model is active on.
+        self.models_page.refresh()
+        self.bus.post("sorters/updated", tab.sorter_id)
+
+    def show_tab_status(self, tab: SorterTab, message: str, *, level: str = INFO, progress: bool | None = None) -> None:
+        """A tab's status line reaches the status bar only while it is in front; the Messages panel keeps every one."""
+        if not self._shell_ready:
+            return
+        text = self._tab_status_text(tab, message)
+        if tab is self.current_tab:
+            self.set_status(text, level=level, progress=progress)
+        else:
+            self._record_status(text, level=level, progress=progress)
+
+    def _tab_status_text(self, tab: SorterTab, message: str) -> str:
+        return f"{tab.name}: {message}" if len(self.tabs) > 1 and message else message
+
+    def drain_all(self) -> int:
+        """Deliver every queued event, the tabs' buses first. Returns how many.
+
+        Tabs first because a tab's handlers post ``sorters/updated`` on the
+        app bus; draining that afterwards puts the dashboard row on screen in
+        the same tick as the change it shows. A worker result (app bus) that
+        posts to a tab is picked up on the next tick, 50 ms later.
+        """
+        count = 0
+        for tab in list(self.tabs):
+            count += tab.bus.drain(max_items=128)
+        return count + self.bus.drain(max_items=128)
 
     def _muted_label(self, text: str, parent: QWidget | None = None) -> QLabel:
         """A label in the muted role — registered so a theme switch recolors it."""
@@ -640,93 +806,6 @@ class QtMainWindow(QMainWindow):
         for name in self.sidebar_buttons:
             self._paint_sidebar_icon(name)
 
-    def _build_sort_page(self) -> QWidget:
-        page = QWidget()
-        column = QVBoxLayout(page)
-        column.setContentsMargins(12, 12, 12, 12)
-        column.setSpacing(10)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal, page)
-        splitter.addWidget(self._build_preview_column(splitter))
-        splitter.addWidget(self._build_grid_column(splitter))
-        # JL: the slot cards are the working surface and get the majority; the
-        # camera is a monitor, not the centerpiece.
-        splitter.setSizes([360, 640])
-
-        # Index 0 is the working dashboard, 1 the first-run guided panel — see
-        # _update_sort_empty_state. Nothing computes the initial state here:
-        # _paint_indicators() (called once _build_ui finishes) does that.
-        self.sort_stack = QStackedWidget(page)
-        self.sort_stack.addWidget(splitter)
-        self.sort_stack.addWidget(self._build_empty_state_panel(page))
-        column.addWidget(self.sort_stack, 1)
-        # At the foot, mirroring the Train page's Training strip (JL): the
-        # working surface first, the launchers under it.
-        column.addLayout(self._build_action_row(page))
-        return page
-
-    def _build_grid_column(self, parent: QWidget) -> QWidget:
-        """The slot grid, with the run counter/reset and the template picker above it.
-
-        JL (follow-up to the run-options move): the counter and reset button
-        felt orphaned floating on the action row — they belong with what
-        they count, not with Start/Stop/Manual feed. Same argument for the
-        template picker: it names the layout these cards *are*.
-        """
-        holder = QWidget(parent)
-        column = QVBoxLayout(holder)
-        # Left margin clears the splitter handle — "Slots" was pressed right
-        # up against the divider line (JL live-testing).
-        column.setContentsMargins(10, 0, 0, 0)
-        column.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.addWidget(self._muted_label("Slots", holder))
-        # The inverse of clicking a card: every headstamp, its slot set on the row (#129).
-        self.assign_by_headstamp_button = QPushButton("Assign by headstamp…", holder)
-        self.assign_by_headstamp_button.clicked.connect(self.open_headstamp_assign)
-        header.addWidget(self.assign_by_headstamp_button)
-        header.addStretch(1)
-        header.addWidget(self._muted_label("Sorted this run", holder))
-        self.master_count_label = QLabel("0", holder)
-        self.master_count_label.setObjectName("masterCount")
-        header.addWidget(self.master_count_label)
-        reset = QPushButton("Reset counts", holder)
-        reset.clicked.connect(self.reset_counts)
-        header.addWidget(reset)
-        self._add_template_group(holder, header)
-        column.addLayout(header)
-
-        self.slot_grid = SlotGrid(self.config, holder)
-        self.slot_grid.slot_clicked.connect(lambda slot: self.open_slot_editor(slot))
-        self.slot_grid.slot_reset.connect(lambda slot: self.reset_slot_count(slot))
-        column.addWidget(self.slot_grid, 1)
-        return holder
-
-    def _build_empty_state_panel(self, page: QWidget) -> QWidget:
-        """First-run guidance in place of a grid nothing has configured yet."""
-        panel = QWidget(page)
-        column = QVBoxLayout(panel)
-        column.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.setSpacing(10)
-
-        title = QLabel(EMPTY_STATE_TITLE, panel)
-        title.setObjectName("emptyStateTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(title)
-        hint = self._muted_label(EMPTY_STATE_HINT, panel)
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(hint)
-
-        self.empty_state_board_button = QPushButton("Connect a board — Settings → Serial", panel)
-        self.empty_state_board_button.clicked.connect(lambda: self._open_settings_section("Serial"))
-        column.addWidget(self.empty_state_board_button)
-
-        self.empty_state_camera_button = QPushButton("Connect a camera — Settings → Camera", panel)
-        self.empty_state_camera_button.clicked.connect(lambda: self._open_settings_section("Camera"))
-        column.addWidget(self.empty_state_camera_button)
-        return panel
-
     def go_to_activity(self, name: str) -> None:
         """Navigate as if the sidebar button had been clicked, checked state included.
 
@@ -745,223 +824,8 @@ class QtMainWindow(QMainWindow):
         if items:
             self.settings_list.setCurrentItem(items[0])
 
-    def _refresh_sort_grid(self) -> None:
-        """Assignments changed (bus event, template swap, mode switch, edit)."""
-        self.slot_grid.refresh_assignments()
-        self._update_sort_empty_state()
-
-    def _update_sort_empty_state(self) -> None:
-        """No board, no camera, nothing routed anywhere yet -> the guided panel.
-
-        Re-evaluated on every indicator paint (camera/serial connect changes)
-        and every assignment change, never cached: any one of the three
-        conditions clearing is enough to swap back to the real dashboard.
-        """
-        connected = self._camera_state[1] or self._serial_state[1]
-        fresh_db = not any(int(h.get("slot", 0)) > 0 for h in self.config.headstamps)
-        self.sort_stack.setCurrentIndex(1 if (not connected and fresh_db) else 0)
-
-    def _build_action_row(self, page: QWidget) -> QHBoxLayout:
-        """The launchers, right-aligned — the Train page's Training strip, mirrored (JL)."""
-        actions = QHBoxLayout()
-        self.action_buttons: dict[str, QPushButton] = {}
-        actions.addStretch(1)
-
-        # Visible whenever the active model has notes at all, acknowledged or
-        # not — it is the history view as well as the ack flow.
-        self.notes_button = QPushButton(NOTES_BUTTON.format(count=0), page)
-        self.notes_button.clicked.connect(lambda: self.open_notes_dialog())
-        self.notes_button.hide()
-        actions.addWidget(self.notes_button)
-
-        feed_button = QPushButton("Manual feed", page)
-        feed_button.clicked.connect(self.manual_feed)
-        actions.addWidget(feed_button)
-        self.action_buttons["Manual feed"] = feed_button
-
-        # No dedicated row for this (JL) — was its own bar under the
-        # template row. The run counter/reset live with the grid instead
-        # (see `_build_grid_column`), not here.
-        self.run_options_button = self._build_run_options_button(page)
-        actions.addWidget(self.run_options_button)
-
-        # One button, two faces (JL): a run is on or it isn't, and the button
-        # that ends it is the one that started it. `_update_run_buttons` owns
-        # the label/role swap. Last on the strip: the green primary sits at
-        # the far right, matching the Training strip (JL).
-        self.run_button = QPushButton(RUN_START_TEXT, page)
-        self.run_button.setObjectName("action")
-        self.run_button.clicked.connect(self.toggle_run)
-        actions.addWidget(self.run_button)
-        self.action_buttons[RUN_TOGGLE_KEY] = self.run_button
-
-        self._update_run_buttons()
-        return actions
-
-    def _add_template_group(self, page: QWidget, bar: QHBoxLayout) -> None:
-        """The template picker, right-aligned on the slot grid's header row.
-
-        JL: which layout a run uses belongs over the cards that layout *is*,
-        after the counters — not down on the launcher strip. The picker and
-        its two edits are a group, so New/Edit shrink to glyphs with tooltips.
-        """
-        self.template_hint = self._muted_label("", page)
-        bar.addWidget(self.template_hint)
-        bar.addWidget(self._muted_label("Template", page))
-        self.template_combo = QComboBox(page)
-        self.template_combo.setMinimumWidth(200)
-        self.template_combo.setMaximumWidth(240)
-        # `activated` is user-only, so repopulating the combo can't look like a switch.
-        self.template_combo.activated.connect(self._on_template_selected)
-        bar.addWidget(self.template_combo)
-        self.template_new_button = QPushButton("+", page)
-        self.template_new_button.setToolTip("New template…")
-        self.template_new_button.clicked.connect(self.new_template)
-        self.template_edit_button = QPushButton("✎", page)
-        self.template_edit_button.setToolTip("Edit template…")
-        self.template_edit_button.clicked.connect(self.edit_template)
-        for button in (self.template_new_button, self.template_edit_button):
-            button.setMaximumWidth(TEMPLATE_BUTTON_WIDTH)
-            bar.addWidget(button)
-        self._refresh_templates()
-
-    def _build_run_options_button(self, page: QWidget) -> QToolButton:
-        """Everything that configures how a run behaves, in one popover.
-
-        Grouped compactly rather than always-visible (JL, increment 14:
-        package mode/batch moved here from the template bar, which now
-        carries only template things).
-        """
-        button = QToolButton(page)
-        button.setText("⚙ Run options")
-        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-
-        menu = QMenu(button)
-        form_holder = QWidget(menu)
-        form = QFormLayout(form_holder)
-        form.setContentsMargins(10, 8, 10, 8)
-
-        self.store_images_combo = QComboBox(form_holder)
-        self.store_images_combo.addItems(list(STORE_IMAGES_LABELS.values()))
-        self.store_images_combo.setCurrentText(STORE_IMAGES_LABELS.get(self.config.run_store_images, "None"))
-        self.store_images_combo.currentTextChanged.connect(self._on_store_images_changed)
-        form.addRow("Store images", self.store_images_combo)
-
-        self.floor_spin = QSpinBox(form_holder)
-        self.floor_spin.setRange(0, 100)
-        self.floor_spin.setSuffix("%")
-        self.floor_spin.setValue(int(self.config.run_confidence_floor))
-        self.floor_spin.valueChanged.connect(self._on_floor_changed)
-        form.addRow("Confidence floor", self.floor_spin)
-
-        self.auto_select_check = QCheckBox("Automatically select trays", form_holder)
-        self.auto_select_check.setChecked(bool(self.config.run_auto_select_trays))
-        self.auto_select_check.toggled.connect(self._on_auto_select_toggled)
-        form.addRow(self.auto_select_check)
-
-        self.package_check = QCheckBox("Package mode", form_holder)
-        self.package_check.setChecked(bool(self.config.run_package_mode))
-        self.package_check.toggled.connect(self._on_package_mode_toggled)
-        form.addRow(self.package_check)
-
-        self.batch_caption = self._muted_label("Batch size", form_holder)
-        self.batch_spin = QSpinBox(form_holder)
-        self.batch_spin.setRange(1, 999999)
-        self.batch_spin.setValue(int(self.config.run_package_size))
-        self.batch_spin.valueChanged.connect(self._on_batch_size_changed)
-        form.addRow(self.batch_caption, self.batch_spin)
-        self._apply_package_visibility()
-
-        action = QWidgetAction(menu)
-        action.setDefaultWidget(form_holder)
-        menu.addAction(action)
-        button.setMenu(menu)
-        return button
-
-    def _on_store_images_changed(self, label: str) -> None:
-        mode = STORE_IMAGES_BY_LABEL.get(label, "none")
-        self.config.set_run_store_images(mode)
-        if mode != "none" and not self._store_warning_shown:
-            self._store_warning_shown = True
-            self.notify(STORE_IMAGES_WARNING_TITLE, STORE_IMAGES_WARNING_TEXT)
-
-    def _on_floor_changed(self, value: int) -> None:
-        # The current-result line reads config.run_confidence_floor live on
-        # every run/history event — no separate wiring for the coloring.
-        self.config.set_run_confidence_floor(int(value))
-
-    def _on_auto_select_toggled(self, checked: bool) -> None:
-        self.config.set_run_auto_select_trays(bool(checked))
-
-    def _build_preview_column(self, parent: QWidget) -> QWidget:
-        """The crop the classifier saw, what it made of it, and — on request — the feed.
-
-        Seth (2026-08-13): the operator watches the *cropped* headstamp and the
-        call made on it, the way the Windows app shows them. The live camera is
-        a setup aid, so it is off by default and secondary when shown.
-        """
-        holder = QWidget(parent)
-        column = QVBoxLayout(holder)
-        # Right margin clears the splitter handle, mirroring the grid
-        # column's left margin (JL: the divider line sat too tight).
-        column.setContentsMargins(0, 0, 10, 0)
-        column.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.addWidget(self._muted_label(CAPTURE_CAPTION, holder))
-        header.addStretch(1)
-        self.show_camera_check = QCheckBox(SHOW_CAMERA_TEXT, holder)
-        # Restored before the preview exists, so the handler is wired below it.
-        self.show_camera_check.setChecked(bool(self._load_setting(SETTING_SHOW_CAMERA)))
-        header.addWidget(self.show_camera_check)
-        column.addLayout(header)
-
-        self.crop_label = _CropPanel(CROP_EMPTY_TEXT, holder)
-        self.crop_label.setObjectName("cropPanel")
-        column.addWidget(self.crop_label, 3)
-        column.addLayout(self._build_result_row(holder))
-
-        self.preview_label = _PreviewLabel(PREVIEW_INITIAL_TEXT, holder)
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # A dead camera is the one thing this panel can usefully say, so it
-        # says where to fix it rather than sitting black (JL). The whole
-        # label is the click target — see _PreviewLabel for why not a link.
-        self.preview_label.clicked.connect(self._on_preview_clicked)
-        # Ignored + tiny minimum: the label must never report the pixmap as
-        # its size hint, or each scaled frame grows the layout that the next
-        # frame is scaled to — the window ratchets larger on every repaint.
-        self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.preview_label.setMinimumSize(1, 1)
-        # A video letterbox is black in every theme; not chrome, so not themed.
-        self.preview_label.setStyleSheet("background-color: #000000; color: #808080;")
-        self.preview_label.setVisible(self.show_camera_check.isChecked())
-        # Smaller stretch than the crop: shown, it is the secondary panel.
-        column.addWidget(self.preview_label, 2)
-        self.show_camera_check.toggled.connect(self._on_show_camera_toggled)
-        return holder
-
-    def _build_result_row(self, holder: QWidget) -> QHBoxLayout:
-        """The current case, Windows-style: what it is and how sure we are."""
-        row = QHBoxLayout()
-        row.addWidget(self._muted_label(HEADSTAMP_CAPTION, holder))
-        self.result_label = QLabel(RESULT_EMPTY_TEXT, holder)
-        self.result_label.setObjectName("currentHeadstamp")
-        row.addWidget(self.result_label)
-        row.addStretch(1)
-        row.addWidget(self._muted_label(CONFIDENCE_CAPTION, holder))
-        self.result_confidence_label = QLabel(RESULT_EMPTY_CONFIDENCE, holder)
-        self.result_confidence_label.setObjectName("currentConfidence")
-        row.addWidget(self.result_confidence_label)
-        self._paint_current_result()
-        return row
-
-    def _on_show_camera_toggled(self, checked: bool) -> None:
-        self.preview_label.setVisible(bool(checked))
-        if checked and not self._camera_state[1]:
-            self._paint_preview_placeholder()
-        self._save_setting(SETTING_SHOW_CAMERA, bool(checked))
-
     def _build_settings_page(self) -> QWidget:
+        """Camera, Serial and Image Processing belong to the front tab; the rest are shared."""
         page = QWidget()
         row = QHBoxLayout(page)
         row.setContentsMargins(12, 12, 12, 12)
@@ -969,15 +833,15 @@ class QtMainWindow(QMainWindow):
         self.settings_list = QListWidget(page)
         self.settings_list.setFixedWidth(160)
         self.settings_pages = QStackedWidget(page)
-        builders = {
+        builders: dict[str, Callable[[], QWidget]] = {
             "Theme": self._build_theme_section,
-            "Serial": self._build_serial_page,
-            "Camera": lambda: build_camera_section(self),
-            "Image Processing": lambda: build_imageproc_section(self),
             WINFORMS_IMPORT_SECTION: lambda: build_winforms_import_section(self),
         }
         for name in SETTINGS_SECTIONS:
             self.settings_list.addItem(name)
+            if name in self.tab_stacks:
+                self.settings_pages.addWidget(self.tab_stacks[name])
+                continue
             build = builders.get(name)
             self.settings_pages.addWidget(build() if build else self._placeholder_page())
         self.settings_list.currentRowChanged.connect(self.settings_pages.setCurrentIndex)
@@ -985,11 +849,6 @@ class QtMainWindow(QMainWindow):
         row.addWidget(self.settings_list)
         row.addWidget(self.settings_pages, 1)
         return page
-
-    def _build_train_page(self) -> QWidget:
-        # Kept on self: mode/changed and navigating to the page both refresh it.
-        self.train_page = build_train_page(self)
-        return self.train_page
 
     def _build_models_page(self) -> QWidget:
         # Kept on self: mode/changed and navigating to the page both refresh it.
@@ -999,12 +858,15 @@ class QtMainWindow(QMainWindow):
         self.models_page.set_evaluate_hook(self._open_evaluator)
         return self.models_page
 
-    def open_help(self) -> None:
-        """F1 / Help menu: the guide dock, opened at the current context's topic."""
-        page = next(
+    def _current_page_name(self) -> str:
+        return next(
             (name for name, w in self._pages_by_name.items() if w is self.pages.currentWidget()),
             "Sort",
         )
+
+    def open_help(self) -> None:
+        """F1 / Help menu: the guide dock, opened at the current context's topic."""
+        page = self._current_page_name()
         section = None
         if page == "Settings":
             item = self.settings_list.currentItem()
@@ -1033,22 +895,24 @@ class QtMainWindow(QMainWindow):
     def _open_model_images(self, model: Any) -> None:
         from .dialog_model_images import ModelImagesDialog
 
-        ModelImagesDialog(self, self.config, model.id).exec()
+        ModelImagesDialog(self, self.current_tab.config, model.id).exec()
+
+    def slot_targets(self) -> list[Any]:
+        """Every sorter tab as a headstamp-editor "Slots for" target, front tab marked."""
+        from .dialog_headstamps import SlotTarget
+
+        return [SlotTarget(t.sorter_id, t.name, t.config, t.bus, front=t is self.current_tab) for t in self.tabs]
 
     def _open_headstamps(self, model: Any) -> None:
         from .dialog_headstamps import HeadstampManagerDialog
 
-        HeadstampManagerDialog(self, self.config, model.id, bus=self.bus).exec()
+        tab = self.current_tab
+        HeadstampManagerDialog(self, tab.config, model.id, bus=tab.bus, slot_targets=self.slot_targets).exec()
 
     def _open_evaluator(self, model: Any) -> None:
         from .dialog_model_evaluator import ModelEvaluatorDialog
 
         ModelEvaluatorDialog(self, self, model).exec()
-
-    def _build_ai_page(self) -> QWidget:
-        # Kept on self: mode/changed and navigating to the page both refresh it.
-        self.ai_page = build_ai_page(self)
-        return self.ai_page
 
     def _build_theme_section(self) -> QWidget:
         page = QWidget()
@@ -1075,11 +939,6 @@ class QtMainWindow(QMainWindow):
 
         ThemeEditorDialog(self, self).exec()
 
-    def _build_serial_page(self) -> QWidget:
-        # Kept on self for tests and the serial/state reactions it subscribes.
-        self.serial_section = build_serial_section(self)
-        return self.serial_section
-
     def _build_dock(self, title: str, widget: QWidget, area: Any, *, scroll_area: bool = True) -> Any:
         """One QtAds panel: closable, movable, floatable, hinted on its tab.
 
@@ -1103,15 +962,12 @@ class QtMainWindow(QMainWindow):
     def _build_serial_dock(self) -> None:
         # The monitor subscribes serial/* itself and keeps the full session
         # history — a dock that exists from startup needs no backlog replay.
-        self.serial_monitor = build_serial_monitor(self)
+        self.serial_monitor = build_serial_monitor(self.current_tab)
         # Bottom, like Arduino IDE's monitor / VS Code's terminal (JL).
         self.serial_dock = self._build_dock("Serial Monitor", self.serial_monitor, ads.BottomDockWidgetArea)
-        # The same traffic, to a file while Settings → Serial has it switched on.
-        self.serial_log = SerialTrafficLog(enabled=bool(self.config.serial.get("log_traffic", False)))
-        self.serial_log.attach(self.bus)
 
     def _build_history_dock(self) -> None:
-        self.history_view = build_history_view(self)
+        self.history_view = build_history_view(self.current_tab)
         # No scroll area: the tile grid sizes itself to the panel and drops
         # what doesn't fit, which only works if it is told the panel's real
         # size (issue #101).
@@ -1200,11 +1056,11 @@ class QtMainWindow(QMainWindow):
         """Re-read everything the import may have rewritten.
 
         It can touch the model library, the active model, every headstamp and
-        slot, and three settings sections at once, so this re-runs the same
-        refresh a mode switch does rather than trying to be surgical.
+        slot, and three settings sections at once, so every tab re-runs the
+        same refresh a mode switch does rather than trying to be surgical.
         """
-        self.config.load()
-        self._on_mode_changed()
+        for tab in self.tabs:
+            tab.reload()
         self.models_page.refresh()
         self.set_status("Imported from the Windows app.")
 
@@ -1248,205 +1104,6 @@ class QtMainWindow(QMainWindow):
             on_done=self.note_update_info,
             on_error=lambda _exc: None,  # silent by design; Help menu re-checks loudly
         )
-
-    # ----- community model settings (A24/A25) ---------------------------------
-
-    def _fetch_community_settings(self) -> None:
-        """One ``FetchModelSettings`` per Sort-page entry, on a worker.
-
-        Gated on the active model being a community one *and* an account
-        already existing — reading the token cache must stay behind a
-        user action, and a signed-out user has nothing to fetch with.
-        Everything downstream fails open: a ``None`` result leaves the local
-        floor and opt-in in charge and raises no prompt.
-        """
-        if self._settings_fetch_busy or self.db is None:
-            return
-        from ..community.feedback import is_community_model
-
-        model = self._active_model()
-        # `model is None` is folded into the guard so the type checker can
-        # narrow it for the rest of this method.
-        if model is None or not is_community_model(model) or not self.community_page.is_signed_in():
-            self._clear_community_settings()
-            self._refresh_notes_button()
-            return
-        uid = str(model.community_model_uid)
-        model_id = int(model.id)
-        name = model.name
-        # The row's own version; 0/absent means "unknown", which never nags.
-        installed = int(model.model_version or 0)
-        api_factory = self.community_page.api_factory
-        find_entry = self.community_page.find_catalogue_entry
-        self._settings_fetch_busy = True
-
-        def work() -> tuple[Any, Any]:
-            api = api_factory()
-            settings = api.fetch_model_settings(uid)
-            info = None
-            if settings is not None and installed > 0 and settings.version > installed:
-                # Only then, and only to fill the dialog + drive the update:
-                # the settings response carries a version number and nothing
-                # else about the published model.
-                try:
-                    info = find_entry(uid, api)
-                except Exception:
-                    info = None
-            return settings, info
-
-        self.run_worker(
-            work,
-            on_done=lambda payload: self._on_community_settings(model_id, uid, name, installed, payload),
-            on_error=lambda _exc: self._on_community_settings_failed(),
-        )
-
-    def _on_community_settings(self, model_id: int, uid: str, name: str, installed: int, payload: Any) -> None:
-        self._settings_fetch_busy = False
-        settings, info = payload if isinstance(payload, tuple) else (None, None)
-        if settings is None:
-            self._on_community_settings_failed()
-            return
-        self._community_settings = (model_id, settings)
-        self._apply_community_settings()
-        if settings.blocked:
-            # The contract prefers saying so over going quiet — once per fetch,
-            # never per case.
-            self.set_status(FEEDBACK_BLOCKED_STATUS)
-
-        from ..community import notes as notes_store
-
-        stored = notes_store.merge(self.db, uid, settings.notes)
-        self._refresh_notes_button()
-
-        newer = installed > 0 and settings.version > installed and info is not None
-        self._model_update = (name, installed, int(settings.version), info) if newer else None
-        self._paint_model_update_button()
-
-        if notes_store.unacknowledged(stored):
-            # Queued: this runs inside a bus drain, and a modal here would
-            # re-enter it (CLAUDE.md §5).
-            QTimer.singleShot(0, self, self.open_notes_dialog)
-
-    def _on_community_settings_failed(self) -> None:
-        """Offline / refused / garbage: back to purely local behaviour."""
-        self._settings_fetch_busy = False
-        self._clear_community_settings()
-        self._refresh_notes_button()
-
-    def _clear_community_settings(self) -> None:
-        self._community_settings = None
-        self._model_update = None
-        self._paint_model_update_button()
-        if self.run_controller is not None:
-            self.run_controller.clear_community_settings()
-
-    def _apply_community_settings(self) -> None:
-        """Push the last fetch's policy into the (possibly rebuilt) controller."""
-        if self.run_controller is None:
-            return
-        if self._community_settings is None:
-            self.run_controller.clear_community_settings()
-            return
-        model_id, settings = self._community_settings
-        self.run_controller.apply_community_settings(
-            model_id,
-            confidence_floor=int(settings.confidence_floor),
-            feedback_enabled=bool(settings.feedback_enabled),
-            blocked=bool(settings.blocked),
-            wish_list=settings.wish_list,
-        )
-
-    def _paint_model_update_button(self) -> None:
-        if self._model_update is None:
-            self.model_update_button.hide()
-            return
-        _name, _installed, available, _info = self._model_update
-        self.model_update_button.setText(MODEL_UPDATE_BUTTON.format(version=available))
-        self.model_update_button.show()
-
-    def model_update_dialog(self) -> Any | None:
-        """The dialog, wired but not shown — tests drive its buttons directly."""
-        if self._model_update is None:
-            return None
-        from .dialog_model_update import build_model_update_dialog
-
-        name, installed, available, info = self._model_update
-        dialog = build_model_update_dialog(
-            self,
-            model_name=name,
-            installed_version=installed,
-            available_version=available,
-            info=info,
-            on_update=self.start_model_update,
-        )
-        # "Not now" (or closing) drops the affordance; the next Sort-page entry
-        # re-fetches and raises it again. No permanent dismissal.
-        dialog.rejected.connect(self.dismiss_model_update)
-        return dialog
-
-    def dismiss_model_update(self) -> None:
-        self._model_update = None
-        self._paint_model_update_button()
-
-    def _open_model_update_dialog(self) -> None:
-        dialog = self.model_update_dialog()
-        if dialog is not None:
-            dialog.exec()
-
-    def start_model_update(self) -> None:
-        """Accepting the prompt: the Community page's own download+import path."""
-        if self._model_update is None:
-            return
-        _name, _installed, _available, info = self._model_update
-        self._model_update = None
-        self._paint_model_update_button()
-        self.community_page.start_update(info)
-
-    # ----- moderator notes ----------------------------------------------------
-
-    def _community_uid(self) -> str | None:
-        model = self._active_model()
-        uid = getattr(model, "community_model_uid", None)
-        return str(uid) if uid else None
-
-    def _stored_notes(self) -> list[Any]:
-        uid = self._community_uid()
-        if uid is None or self.db is None:
-            return []
-        from ..community import notes as notes_store
-
-        return notes_store.load(self.db, uid)
-
-    def _refresh_notes_button(self) -> None:
-        notes = self._stored_notes()
-        self.notes_button.setText(NOTES_BUTTON.format(count=len(notes)))
-        self.notes_button.setVisible(bool(notes))
-
-    def notes_dialog(self) -> Any | None:
-        """The dialog, wired but not shown — tests drive its buttons directly."""
-        from .dialog_community_notes import build_community_notes_dialog
-
-        uid = self._community_uid()
-        if uid is None:
-            return None
-        model = self._active_model()
-        return build_community_notes_dialog(
-            self,
-            model_name=getattr(model, "name", ""),
-            notes=self._stored_notes(),
-            on_acknowledge=lambda ids: self._acknowledge_notes(uid, ids),
-        )
-
-    def _open_notes_dialog(self) -> None:
-        dialog = self.notes_dialog()
-        if dialog is not None:
-            dialog.exec()
-
-    def _acknowledge_notes(self, uid: str, ids: list[int]) -> None:
-        from ..community import notes as notes_store
-
-        notes_store.acknowledge(self.db, uid, ids)
-        self._refresh_notes_button()
 
     def _build_help_dock(self) -> None:
         # A dock, not a free window (JL): pin the guide beside the work while
@@ -1583,17 +1240,25 @@ class QtMainWindow(QMainWindow):
     # ----- navigation ---------------------------------------------------------
 
     def open_activity(self, name: str) -> None:
-        """What a sidebar click does: every activity is a page of its own."""
+        """What a sidebar click does: every activity is a page of its own.
+
+        From the dashboard, a sidebar click goes back to the front sorter tab.
+        """
+        if self.dashboard_showing():
+            self._activity = name
+            self.show_tab(self.current_tab)
+            return
         self.show_page(name)
 
     def show_page(self, name: str) -> None:
+        if name == DASHBOARD_TITLE:
+            self._show_dashboard()
+            return
+        self._activity = name
         self.pages.setCurrentWidget(self._pages_by_name[name])
+        tab = self.current_tab
         if name == "Sort":
-            # Assignments can have changed in Settings since the cards were
-            # last drawn; they are cheap to re-read and never cached.
-            self._refresh_sort_grid()
-            self._refresh_notes_button()
-            self._fetch_community_settings()
+            tab.enter_sort()
         elif name == "Models":
             self.models_page.refresh(announce=True)
         elif name == "Community":
@@ -1601,11 +1266,11 @@ class QtMainWindow(QMainWindow):
         elif name == "Train":
             # Headstamps and images change from the Models page and from
             # imports; the counts are read off disk every time, never cached.
-            self.train_page.refresh()
+            tab.train_page.refresh()
         elif name == AI_CONFIG_ACTIVITY:
             # A click on the *muted* entry has to land on the explainer naming
             # the active model, not on whatever the last mode change left.
-            self.ai_page.refresh_mode()
+            tab.ai_page.refresh_mode()
 
     def _open_data_folder(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(app_data_dir())))
@@ -1626,142 +1291,6 @@ class QtMainWindow(QMainWindow):
 
         build_license_dialog(self).exec()
 
-    def open_slot_editor(self, slot: int) -> None:
-        """Edit what routes to one slot. The catch-all isn't configurable."""
-        if int(slot) == 0:
-            self.set_status(CATCH_ALL_HINT)
-            return
-        dialog = SlotAssignDialog(self.config, int(slot), self)
-        dialog.changed.connect(self._refresh_sort_grid)
-        dialog.exec()
-        self._refresh_sort_grid()
-
-    def open_headstamp_assign(self) -> None:
-        """Every headstamp in one table; the cards repaint on each edit while it is open.
-
-        ``open()``, not ``exec()``: modal to the window but returning at once,
-        so a test can drive the dialog it leaves in ``headstamp_assign_dialog``.
-        """
-        dialog = build_headstamp_assign_dialog(self)
-        dialog.changed.connect(self._refresh_sort_grid)
-        dialog.finished.connect(self._on_headstamp_assign_closed)
-        self.headstamp_assign_dialog = dialog
-        dialog.open()
-
-    def _on_headstamp_assign_closed(self, _result: int) -> None:
-        dialog, self.headstamp_assign_dialog = self.headstamp_assign_dialog, None
-        if dialog is not None:
-            dialog.deleteLater()
-        self._refresh_sort_grid()
-
-    def _refresh_templates(self) -> None:
-        """Repopulate the combo for the active model + current run mode."""
-        mode = self.config.slot_template_mode()
-        self._templates = self.config.list_slot_templates(mode)
-        active = self.config.active_slot_template(mode)
-        self.template_combo.clear()
-        self.template_combo.addItems([t.name for t in self._templates])
-        for index, template in enumerate(self._templates):
-            if template.id == active.id:
-                self.template_combo.setCurrentIndex(index)
-                break
-        self.template_hint.setText("Package-mode layout" if mode == "package" else "")
-
-    def _template_busy(self) -> bool:
-        """Templates swap the whole layout, so keep them out of a live run."""
-        if not self._is_running:
-            return False
-        self.notify(
-            "Run in progress",
-            "Stop the run before changing sorting templates — switching one reassigns every slot.",
-        )
-        return True
-
-    def _on_template_selected(self, index: int) -> None:
-        if index < 0 or index >= len(self._templates):
-            return
-        target = self._templates[index]
-        if self._template_busy() or self.config.activate_slot_template(target.id) is None:
-            self._refresh_templates()  # snap the combo back to the active one
-            return
-        self._after_template_change(f"Loaded sorting template “{target.name}”.")
-
-    def new_template(self) -> None:
-        if self._template_busy():
-            return
-        mode = self.config.slot_template_mode()
-        dialog = NewTemplateDialog(self.config, mode, self.config.active_slot_template(mode).name, self)
-        if dialog.exec() and dialog.created is not None:
-            self._after_template_change(f"Created sorting template “{dialog.created.name}”.")
-
-    def edit_template(self) -> None:
-        if self._template_busy():
-            return
-        mode = self.config.slot_template_mode()
-        dialog = EditTemplateDialog(
-            self.config,
-            self.config.active_slot_template(mode),
-            can_delete=len(self.config.list_slot_templates(mode)) > 1,
-            parent=self,
-        )
-        if dialog.exec():
-            self._after_template_change("Sorting templates updated.")
-
-    def _after_template_change(self, status: str) -> None:
-        """Counters are per-layout: a slot may hold another headstamp now."""
-        self._refresh_templates()
-        self._clear_counts()
-        self._refresh_sort_grid()
-        self.set_status(status)
-
-    def _apply_package_visibility(self) -> None:
-        enabled = self.package_check.isChecked()
-        self.batch_caption.setVisible(enabled)
-        self.batch_spin.setVisible(enabled)
-
-    def _on_package_mode_toggled(self, enabled: bool) -> None:
-        self.config.set_run_package_mode(bool(enabled))
-        self._apply_package_visibility()
-        # Counts, assignments and templates are all mode-specific.
-        self._clear_counts()
-        self._refresh_templates()
-        self._refresh_sort_grid()
-
-    def _on_batch_size_changed(self, value: int) -> None:
-        self.config.set_run_package_size(int(value))
-        self._refresh_sort_grid()
-
-    def _clear_counts(self) -> None:
-        self.slot_grid.reset_counts()
-        self._master_count = 0
-        self.master_count_label.setText("0")
-
-    def reset_counts(self) -> None:
-        """Zero the dashboard's counters and the run's package batches."""
-        self._clear_counts()
-        reset = getattr(self.run_controller, "reset_package_counts", None)
-        if reset is not None:
-            reset()
-        self.set_status("Counters reset.")
-
-    def reset_slot_count(self, slot: int) -> None:
-        """Package mode: empty one bin and let it refill while the run continues."""
-        reset = getattr(self.run_controller, "reset_package_slot", None)
-        if reset is not None:
-            reset(int(slot))
-        self.slot_grid.reset_slot(int(slot))
-        self.set_status(f"Reset counter for slot {slot}.")
-
-    # ----- active-model mode --------------------------------------------------
-
-    def _active_model(self) -> Any | None:
-        if self.db is None:
-            return None
-        from ..data.repository import ModelRepo, SettingsRepo
-
-        model_id = SettingsRepo(self.db).get_active_model_id()
-        return ModelRepo(self.db).get(model_id) if model_id is not None else None
-
     def _apply_mode_visibility(self) -> None:
         """The mode inks the Train / AI Config pair. **Neither is ever hidden**
         (JL: a hidden activity is one nobody finds).
@@ -1776,7 +1305,7 @@ class QtMainWindow(QMainWindow):
         """
         from ..data.models import is_openai_model, is_trainable
 
-        model = self._active_model()
+        model = self.current_tab.active_model()
         train_live = is_trainable(model)
         ai_live = model is None or is_openai_model(model)
         self._set_activity_unavailable("Train", not train_live)
@@ -1810,23 +1339,6 @@ class QtMainWindow(QMainWindow):
         if not visible and page is not None and self.pages.currentWidget() is page:
             self.sidebar_buttons["Sort"].setChecked(True)
             self.show_page("Sort")
-
-    def _on_mode_changed(self) -> None:
-        """The active model changed: everything scoped to it is re-read."""
-        self._apply_mode_visibility()
-        self._clear_counts()
-        self._refresh_templates()
-        self._refresh_sort_grid()
-        self.ai_page.refresh_mode()
-        # The server's policy and the version prompt belonged to the old model.
-        self._clear_community_settings()
-        self._refresh_notes_button()
-        # Everything on the Train page is scoped to the active model.
-        self.train_page.refresh()
-        # The library's active marker is the mode, spelled out per row.
-        self.models_page.refresh()
-        # AI Config mode has no local device; a model switch re-evaluates it.
-        self.refresh_device_indicator()
 
     # ----- theme --------------------------------------------------------------
 
@@ -1904,7 +1416,8 @@ class QtMainWindow(QMainWindow):
         for label in self._muted_labels:
             label.setStyleSheet(muted)
         # Colors baked into rich text / per-line paints need a hand re-render.
-        self._paint_current_result()
+        for tab in self.tabs:
+            tab.apply_palette()
         if hasattr(self, "sidebar_buttons"):
             self._paint_sidebar_icons()
         if hasattr(self, "serial_monitor"):
@@ -1915,8 +1428,14 @@ class QtMainWindow(QMainWindow):
             self.models_page.apply_palette()
         if hasattr(self, "messages_view"):
             self.messages_view.apply_palette()
-        # Indicator dots carry state, not a palette role a stylesheet can reach.
-        self._paint_indicators()
+        if hasattr(self, "dashboard_page"):
+            self.dashboard_page.apply_palette()
+        # Indicator dots and tab markers carry state, not a palette role a
+        # stylesheet can reach.
+        if self._shell_ready:
+            self._paint_indicators()
+            for tab in self.tabs:
+                self._paint_tab_marker(tab)
 
     # ----- status -------------------------------------------------------------
 
@@ -1929,6 +1448,10 @@ class QtMainWindow(QMainWindow):
         """
         text = str(message)
         self.statusBar().showMessage(text)
+        self._record_status(text, level=level, progress=progress)
+
+    def _record_status(self, text: str, *, level: str = INFO, progress: bool | None = None) -> None:
+        """Keep a status line in the Messages panel without showing it on the bar."""
         entry = self.status_log.add(text, level=level, progress=progress)
         # A file-only trail of what the operator was shown; the panel isn't saved.
         if not entry.progress:
@@ -1961,41 +1484,21 @@ class QtMainWindow(QMainWindow):
         return f'<span style="color: {color};">●</span> {html.escape(str(message))}'
 
     def _paint_indicators(self) -> None:
+        """Camera and serial dots, for the front tab."""
+        tab = self.current_tab
         for label, (message, connected) in (
-            (self.camera_label, self._camera_state),
-            (self.serial_label, self._serial_state),
+            (self.camera_label, tab.camera_state),
+            (self.serial_label, tab.serial_state),
         ):
             label.setText(self._indicator_html(message, connected=connected))
-        self._paint_preview_placeholder()
-        # Every camera/serial connect-state change can flip the Sort page
-        # between the guided empty state and the real dashboard.
-        self._update_sort_empty_state()
 
-    def _camera_placeholder_text(self) -> str:
-        return f"{CAMERA_DEAD_TEXT} — {CAMERA_DEAD_LINK}"
-
-    def _paint_preview_placeholder(self) -> None:
-        """A camera that isn't connected says so where the feed would be."""
-        if self._camera_state[1]:
-            return  # frames are arriving (or about to); the timer owns the label
-        # Painted before the Sort page exists on the very first indicator paint.
-        label = getattr(self, "preview_label", None)
-        if label is not None:
-            label.setText(self._camera_placeholder_text())
-            label.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def _on_preview_clicked(self) -> None:
-        if not self._camera_state[1]:
-            self._open_settings_section("Camera")
-
-    def _set_camera_indicator(self, message: str, *, connected: bool) -> None:
-        self._camera_state = (message, connected)
-        self._paint_indicators()
-
-    def _set_serial_indicator(self, message: str, *, connected: bool) -> None:
-        self._serial_state = (message, connected)
-        self._paint_indicators()
-        self.bus.post("serial/state", {"connected": connected, "message": message})
+    def _paint_model_update_button(self) -> None:
+        version = self.current_tab.model_update_version
+        if version is None:
+            self.model_update_button.hide()
+            return
+        self.model_update_button.setText(MODEL_UPDATE_BUTTON.format(version=version))
+        self.model_update_button.show()
 
     def refresh_device_indicator(self) -> None:
         """Show where local classification runs, once that is known.
@@ -2007,7 +1510,7 @@ class QtMainWindow(QMainWindow):
         local device is involved.
         """
         text: str | None = None
-        if self.db is not None and classifier.uses_local_inference(self.db):
+        if classifier.uses_local_inference(self.db, model_id=self.current_tab.config.active_model_id):
             text = local_inference.device_description()
         if text:
             self.device_label.setText(f"Inference: {text}")
@@ -2027,7 +1530,7 @@ class QtMainWindow(QMainWindow):
         Startup-only (behind ``auto_connect``): a model activated later gets
         its indicator from the first classification instead.
         """
-        if self.db is None or not classifier.uses_local_inference(self.db):
+        if not classifier.uses_local_inference(self.db, model_id=self.current_tab.config.active_model_id):
             return
         if not local_inference.is_installed() or local_inference.device_description():
             return
@@ -2037,474 +1540,56 @@ class QtMainWindow(QMainWindow):
             on_error=lambda _exc: None,
         )
 
-    # ----- camera -------------------------------------------------------------
-
-    def start_camera(self) -> None:
-        try:
-            if self.camera.start_preview():
-                self._set_camera_indicator(
-                    f"Camera: connected ({self.camera.width}x{self.camera.height})",
-                    connected=True,
-                )
-            else:
-                # The red dot alone left the user with nowhere to go (JL).
-                self.bus.post("status/error", CAMERA_FAILED_STATUS)
-                self._set_camera_indicator("Camera: failed to start", connected=False)
-        except Exception as exc:
-            self.bus.post("status/error", f"Camera error: {exc} — pick a device in Settings → Camera.")
-            self._set_camera_indicator("Camera: error", connected=False)
-
-    @staticmethod
-    def frame_to_image(frame: np.ndarray) -> QImage:
-        """Wrap a BGR numpy frame as a QImage.
-
-        ``QImage`` borrows the buffer it is handed, so the copy is what cuts
-        the result loose from a frame the grab thread is about to overwrite.
-        """
-        buffer = np.ascontiguousarray(frame)
-        height, width = buffer.shape[:2]
-        image = QImage(buffer.data, width, height, buffer.strides[0], QImage.Format.Format_BGR888)
-        return image.copy()
-
-    def _refresh_preview(self) -> None:
-        # Hidden is the default; while hidden no frame is fetched or painted
-        # (the camera's grab thread runs regardless).
-        if not self.show_camera_check.isChecked():
-            return
-        frame = self.camera.latest_frame()
-        if frame is None:
-            return
-        pixmap = QPixmap.fromImage(self.frame_to_image(frame))
-        self.preview_label.setPixmap(
-            pixmap.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-
-    # ----- serial -------------------------------------------------------------
+    # ----- startup serial -----------------------------------------------------
 
     def _auto_connect_serial(self) -> None:
-        """Try the saved port first, then walk the rest until one handshakes.
+        """One tab: the full walk, as before tabs existed. Several: saved ports only.
 
-        Ports are probed on a worker (``try_open`` waits out the handshake);
-        ``_after_connect`` is the shared tail with the Settings page's own
-        Connect, so both build the run controller and push the init settings.
+        With several tabs each opens only its own saved port, and all of them
+        open on one worker in tab order, so no two tabs race for a board and
+        the device claims land in a predictable order on the main thread.
         """
-        saved_port = (self.config.serial.get("port") or "").strip()
-        if saved_port == EMULATED_PORT:
-            broker = EmulatorBroker()
-            broker.try_open()
-            self._after_connect(broker, EMULATED_PORT)
+        if len(self.tabs) == 1:
+            self.tabs[0].auto_connect_serial()
+            return
+        jobs: list[tuple[SorterTab, str]] = []
+        for tab in self.tabs:
+            port = (tab.config.serial.get("port") or "").strip()
+            if not port:
+                tab.set_status("No saved port. Connect in Settings → Serial.")
+            elif port == EMULATED_PORT:
+                tab.connect_serial(port)
+            else:
+                jobs.append((tab, port))
+        if not jobs:
             return
 
-        available = serial_broker.list_serial_ports()
-        candidates: list[str] = []
-        # The saved port is always probed, even if the filter below would
-        # skip it — the user chose it once, so it is not a guess.
-        if saved_port and saved_port in available:
-            candidates.append(saved_port)
-        for port in available:
-            if port not in candidates and serial_broker.is_probe_candidate(port):
-                candidates.append(port)
-        skipped = [p for p in available if p not in candidates]
-        if skipped:
-            self.bus.post(
-                "serial/note",
-                "skipping (Bluetooth/pseudo, connect manually from Settings → Serial): " + ", ".join(skipped),
-            )
+        def work() -> list[tuple[SorterTab, str, Any]]:
+            opened: set[str] = set()
+            results: list[tuple[SorterTab, str, Any]] = []
+            for tab, port in jobs:
+                # Two tabs saved the same port: the first one to open it has it.
+                broker = None if port in opened else tab.open_saved_port_blocking(port)
+                if broker is not None:
+                    opened.add(port)
+                results.append((tab, port, broker))
+            return results
 
-        if not candidates:
-            self.set_status("No serial ports detected.")
-            self._set_serial_indicator("Serial: no ports", connected=False)
-            return
+        def done(results: list[tuple[SorterTab, str, Any]]) -> None:
+            for tab, port, broker in results:
+                if tab in self.tabs:
+                    tab.finish_saved_port(port, broker)
+                elif broker is not None:
+                    broker.stop()
 
-        baud = int(self.config.serial.get("baud", 9600))
-        probe_timeout = float(self.config.serial.get("handshake_timeout_s", serial_broker.HANDSHAKE_READ_TIMEOUT_S))
-
-        def _probe() -> tuple[Any, str] | tuple[None, None]:
-            for port in candidates:
-                self.bus.post("status", f"Auto-connect: probing {port}…")
-                self.bus.post("serial/note", f"probing {port} @ {baud}…")
-                broker = serial_broker.SerialBroker(
-                    port=port,
-                    baud=baud,
-                    require_serial_ready=True,
-                    handshake_timeout_s=probe_timeout,
-                )
-                # Listen *before* the handshake: whatever the board says to a
-                # probe that fails is the only evidence of why it failed.
-                self._attach_serial_listeners(broker)
-                if broker.try_open():
-                    broker.start()
-                    return broker, port
-                self.bus.post("serial/note", f"{port} did not handshake")
-            return None, None
-
-        self.set_status(f"Auto-connecting to serial — {len(candidates)} port(s) to try…")
+        self.set_status(f"Auto-connecting {len(jobs)} sorter(s) to their saved ports…")
         self.run_worker(
-            _probe,
-            on_done=self._finalize_auto_connect,
-            on_error=lambda exc: self.set_status(f"Auto-connect error: {exc}", level=ERROR),
+            work, on_done=done, on_error=lambda exc: self.set_status(f"Auto-connect error: {exc}", level=ERROR)
         )
-
-    def _finalize_auto_connect(self, result: tuple[Any, str] | tuple[None, None]) -> None:
-        broker, port = result
-        if broker is None or port is None:
-            self.set_status("No board responded on any port.")
-            self._set_serial_indicator("Serial: no board found", connected=False)
-            return
-        self._after_connect(broker, port)
-
-    def _attach_serial_listeners(self, broker: Any) -> None:
-        """Fan a broker's traffic onto the bus, once — a second attach doubles every line."""
-        if getattr(broker, "_bus_listeners_attached", False):
-            return
-        broker.on_received.append(lambda line: self.bus.post("serial/rx", line))
-        broker.on_sent.append(lambda line: self.bus.post("serial/tx", line))
-        # Fires on the reader thread (or a failed writer's), so it goes through
-        # the bus like everything else rather than touching a widget directly.
-        on_disconnect = getattr(broker, "on_disconnect", None)
-        if isinstance(on_disconnect, list):
-            on_disconnect.append(lambda reason: self.bus.post("serial/disconnected", reason))
-        broker._bus_listeners_attached = True
-
-    def _after_connect(self, broker: Any, port: str, *, source: str = "auto") -> None:
-        """Shared tail of both connect paths: listeners, persistence, controller."""
-        self._attach_serial_listeners(broker)
-        self.broker = broker
-        baud = int(getattr(broker, "baud", self.config.serial.get("baud", 9600)))
-        if port != (self.config.serial.get("port") or "") or baud != int(self.config.serial.get("baud", 9600)):
-            self.config.serial["port"] = port
-            self.config.serial["baud"] = baud
-            self.config.save()
-        self._set_serial_indicator(
-            f"Serial: connected ({port} @ {getattr(broker, 'baud', '?')}) — {broker.firmware_version}",
-            connected=True,
-        )
-        self.set_status(f"{'Auto-connected' if source == 'auto' else 'Connected'} to {port}.")
-        self._rebuild_run_controller()
-        # Pushed from the shared connect tail, so auto-connect and the Settings
-        # page behave alike.
-        if self.config.serial.get("init_on_startup", False):
-            settings = dict(self.config.serial.get("init_settings", {}))
-            if settings:
-                self.run_worker(
-                    lambda: broker.update_init_settings(settings),
-                    on_done=lambda _r: self.set_status(f"Connected to {port}. Init settings pushed."),
-                    on_error=lambda err: self.set_status(f"Init push failed: {err}", level=ERROR),
-                )
-
-    def connect_serial(self, port: str | None = None) -> None:
-        """Open one explicit port, chosen in Settings → Serial.
-
-        Mirrors ``ui.app.MainWindow.connect_serial``: the emulator is opened
-        inline (nothing blocks), a real port opens on a worker because
-        ``try_open`` waits out the board's handshake.
-        """
-        if self.broker is not None:
-            try:
-                if self.run_controller is not None:
-                    self.run_controller.stop()
-                self.broker.stop()
-            except Exception:
-                pass
-            self.broker = None
-            self.run_controller = None
-            self._update_run_buttons()
-
-        if port is None:
-            port = (self.config.serial.get("port") or "").strip()
-        if not port:
-            self.set_status("No port selected.")
-            self._set_serial_indicator("Serial: no port selected", connected=False)
-            return
-
-        if port == EMULATED_PORT:
-            broker: Any = EmulatorBroker()
-            broker.try_open()
-            self._after_connect(broker, port, source="manual")
-            return
-
-        baud = int(self.config.serial.get("baud", 9600))
-        broker = serial_broker.SerialBroker(port=port, baud=baud, require_serial_ready=True)
-        # As in the probe: a failed open should still leave a trace in the monitor.
-        self._attach_serial_listeners(broker)
-        self.set_status(f"Connecting to {port}…")
-
-        def _open() -> bool:
-            if not broker.try_open():
-                return False
-            broker.start()
-            return True
-
-        def _done(opened: bool) -> None:
-            if not opened:
-                self.set_status(f"Failed to open {port}.", level=ERROR)
-                self._set_serial_indicator(f"Serial: failed to open {port}", connected=False)
-                return
-            self._after_connect(broker, port, source="manual")
-
-        self.run_worker(
-            _open,
-            on_done=_done,
-            on_error=lambda exc: self.set_status(f"Connect error: {exc}", level=ERROR),
-        )
-
-    def _on_serial_disconnected(self, reason: Any = None) -> None:
-        """The link died on its own: say so, drop the board, stop the run.
-
-        Nothing here reconnects. The board's arm position and the wheel's
-        pipeline are only knowable while the link is up, so recovery is an
-        explicit reconnect (which re-handshakes through ``try_open``), not a
-        silent one — see ``SERIAL_LOST_TEXT``.
-        """
-        detail = str(reason or "link lost")
-        port = str(getattr(self.broker, "port", "") or self.config.serial.get("port") or "")
-        self.bus.post("serial/note", f"disconnected — {detail}")
-        was_running = self._is_running
-
-        controller, self.run_controller = self.run_controller, None
-        if controller is not None:
-            controller.stop()
-        broker, self.broker = self.broker, None
-        if broker is not None:
-            try:
-                broker.stop()
-            except Exception:
-                pass
-
-        self._set_serial_indicator(
-            f"Serial: disconnected ({port})" if port else "Serial: disconnected",
-            connected=False,
-        )
-        self._update_run_buttons()
-        self.set_status(f"Serial disconnected — {detail}", level=ERROR)
-        if was_running:
-            self.beep()
-            # Same shape as the package halt: a modal, queued out of the drain
-            # so it can't re-enter it.
-            QTimer.singleShot(0, self, lambda: self.notify(SERIAL_LOST_TITLE, SERIAL_LOST_TEXT))
-
-    # ----- run ----------------------------------------------------------------
-
-    def _rebuild_run_controller(self) -> None:
-        if self.broker is None:
-            return
-        self.run_controller = RunController(
-            config=self.config,
-            broker=self.broker,
-            camera=self.camera,
-            bus=self.bus,
-            db=self.db,
-        )
-        # A fresh controller carries a fresh FeedbackService, so the server's
-        # policy has to be re-installed on it.
-        self._apply_community_settings()
-        self._refresh_sort_grid()
-        self._update_run_buttons()
 
     def notify(self, title: str, text: str) -> None:
         """User-facing warning. Tests patch this — never let a modal open there."""
         QMessageBox.warning(self, title, text)
-
-    def _ai_credentials_missing(self) -> bool:
-        """HTTP classification can't run without an API key and a model name.
-
-        Scoped to the HTTP paths: a local model never touches the HTTP
-        client, so an unset key there is no reason to refuse a run. An
-        active openai-mode model is checked against **its own** config — the
-        same one `classify_active` will use — never the app-level one.
-        """
-        from ..data.models import is_openai_model
-
-        model = classifier.active_model(self.db)
-        if is_openai_model(model):
-            cfg = model.ai_model_config if model is not None else None
-            return cfg is None or not (cfg.api_key and cfg.model)
-        if classifier.uses_local_inference(self.db):
-            return False
-        api = self.config.api
-        return not (api.get("api_key") and api.get("model"))
-
-    def _ready_to_sort(self) -> RunController | None:
-        """Preflight: board, moderator notes, AI config, checkpoint, torch.
-
-        Each check is asked of the layer that owns the answer, so the Qt shell
-        never re-derives the rule. Returns the controller when a run may start.
-        An unacknowledged moderator note gates Start (issue #29, A25).
-        """
-        controller = self.run_controller
-        if controller is None or self.broker is None:
-            self.set_status("Connect to the board first (Settings → Serial).")
-            return None
-        from ..community.notes import unacknowledged
-
-        if unacknowledged(self._stored_notes()):
-            self.notify(NOTES_GATE_TITLE, NOTES_GATE_TEXT)
-            return None
-        if self._ai_credentials_missing():
-            self.notify(
-                "AI not configured",
-                "Set the endpoint, API key and model on the AI Config page first.",
-            )
-            return None
-        problem = classifier.checkpoint_problem(self.db)
-        if problem is not None:
-            self.notify("Model not ready", problem)
-            return None
-        if classifier.uses_local_inference(self.db) and not self.ensure_torch(
-            self.start_run,
-            reason="Sorting needs PyTorch",
-            # The model decides block-vs-offer on an outdated torch, so the
-            # gate needs to know whose checkpoint is about to be loaded.
-            model=classifier.active_model(self.db),
-        ):
-            # The gate re-enters start_run after a successful install.
-            return None
-        return controller
-
-    @staticmethod
-    def _set_button_role(button: QPushButton, object_name: str) -> None:
-        """Swap a button's palette role. QSS matches on the objectName, and a
-        live widget has to be re-polished for the new rule to take."""
-        if button.objectName() == object_name:
-            return
-        button.setObjectName(object_name)
-        style = button.style()
-        style.unpolish(button)
-        style.polish(button)
-
-    def toggle_run(self) -> None:
-        """The one button's handler; the run state decides which half it is."""
-        if self._is_running:
-            self.stop_run()
-        else:
-            self.start_run()
-
-    def start_run(self) -> None:
-        controller = self._ready_to_sort()
-        if controller is None or self._is_running:
-            return
-        self._refresh_sort_grid()
-        controller.start()
-
-    def stop_run(self) -> None:
-        if self.run_controller is not None:
-            self.run_controller.stop()
-            self.set_status("Stopping…")
-
-    def manual_feed(self) -> None:
-        controller = self._ready_to_sort()
-        if controller is None or self._is_running:
-            return
-        # One cycle blocks on the board; the bus carries the result back.
-        self.run_worker(controller.cycle_once)
-
-    def _on_run_started(self) -> None:
-        # Counts survive Stop/Start on purpose: operators stop to clear a jam
-        # and restart mid-tray. Only the explicit resets clear.
-        self._set_running(True)
-
-    def _on_run_stopped(self) -> None:
-        self._set_running(False)
-        # Terminal status, or whatever was in flight ("Stopping…",
-        # "Classifying…") reads as stuck forever (Seth).
-        self.set_status("Run stopped.")
-
-    def _set_running(self, running: bool) -> None:
-        self._is_running = running
-        self._update_run_buttons()
-
-    def _update_run_buttons(self) -> None:
-        connected = self.broker is not None
-        running = self._is_running
-        # A run that outlives its board still has to be stoppable.
-        self.run_button.setEnabled(connected or running)
-        self.run_button.setText(RUN_STOP_TEXT if running else RUN_START_TEXT)
-        self._set_button_role(self.run_button, "danger" if running else "action")
-        self.action_buttons["Manual feed"].setEnabled(connected and not running)
-        for button in (self.run_button, self.action_buttons["Manual feed"]):
-            button.setToolTip("" if connected else "Connect to the board first")
-        # The Train page's Feed drives the same board.
-        train_page = getattr(self, "train_page", None)
-        if train_page is not None:
-            train_page.refresh_connection()
-
-    def _on_run_result(self, result: Any) -> None:
-        # `run/result` carries a slot even for a failed cycle, so `ok` is what
-        # decides whether a case actually landed anywhere.
-        if not isinstance(result, dict) or not result.get("ok"):
-            return
-        self.slot_grid.increment(int(result.get("slot") or 0))
-        self._master_count += 1
-        self.master_count_label.setText(str(self._master_count))
-
-    def _on_run_history(self, payload: Any) -> None:
-        """The current case: its crop and the call made on it. Nothing accumulates."""
-        if not isinstance(payload, dict):
-            return
-        self._show_crop(payload.get("image"))
-        confidence = float(payload.get("confidence", 0) or 0)
-        floor = float(getattr(self.config, "run_confidence_floor", 0) or 0)
-        label = str(payload.get("label") or "(empty)")
-        parent = payload.get("parent")
-        self._current_result = (
-            f"{parent} · {label}" if parent else label,
-            confidence,
-            floor <= 0 or confidence >= floor,
-        )
-        self._paint_current_result()
-
-    def _paint_current_result(self) -> None:
-        """The confidence colour is baked in, so a theme switch re-runs this."""
-        if self._current_result is None:
-            self.result_label.setText(RESULT_EMPTY_TEXT)
-            self.result_confidence_label.setText(RESULT_EMPTY_CONFIDENCE)
-            self.result_confidence_label.setStyleSheet(f"color: {self.palette_colors['text_muted']};")
-            return
-        label, confidence, above_floor = self._current_result
-        self.result_label.setText(label)
-        self.result_confidence_label.setText(f"{confidence:.0f}%")
-        color = self.palette_colors["success" if above_floor else "warning"]
-        self.result_confidence_label.setStyleSheet(f"color: {color};")
-
-    def _show_crop(self, image: Any) -> None:
-        """The headstamp as the classifier saw it — the column's primary panel."""
-        if not isinstance(image, np.ndarray) or image.size == 0:
-            return
-        self.crop_label.set_source(QPixmap.fromImage(self.frame_to_image(image)))
-
-    def beep(self) -> None:
-        """Non-blocking batch-complete tone. Best-effort — never fails a handler."""
-        try:
-            QApplication.beep()
-        except Exception:
-            pass
-
-    def _on_package_full(self, payload: Any) -> None:
-        data = payload if isinstance(payload, dict) else {}
-        self.beep()
-        self.set_status(f"Slot {data.get('slot')} batch full ({data.get('count')}). Reset it to refill.")
-
-    def _on_out_of_brass(self, payload: Any) -> None:
-        data = payload if isinstance(payload, dict) else {}
-        flushed = data.get("flushed", 0)
-        self.beep()
-        self.set_status(f"Out of brass — run finished. {flushed} in-flight case(s) were flushed to their slots.")
-
-    def _on_package_halt(self, payload: Any) -> None:
-        label = (payload or {}).get("label") if isinstance(payload, dict) else None
-        self.beep()
-        message = (
-            f"Run stopped — every slot for “{label or '?'}” is full. "
-            "Empty the bins, reset their counters, then Start again."
-        )
-        self.set_status(message)
-        # Operators rely on the dialog here, not just the status line. Queued
-        # single-shot: a modal straight from a bus handler re-enters the drain.
-        QTimer.singleShot(0, self, lambda: self.notify("Package complete", message))
 
     # ----- worker dispatch ----------------------------------------------------
 
@@ -2558,11 +1643,11 @@ class QtMainWindow(QMainWindow):
     # ----- lifecycle ----------------------------------------------------------
 
     def closeEvent(self, event: Any) -> None:
-        # No confirm-on-close while a run is active — stop the controller and
+        # No confirm-on-close while a run is active: stop every controller and
         # go, the way this app has always closed.
         # The timers first: a closed-but-not-destroyed window (every test
-        # window, and the real one between close and quit) must go inert —
-        # left running, each keeps draining its bus and repainting its
+        # window, and the real one between close and quit) must go inert.
+        # Left running, each keeps draining its buses and repainting its
         # preview forever, and hundreds of those zombie ticks in one event
         # pump is what took an access violation on the Windows CI runner.
         for timer in (self._bus_timer, self._preview_timer):
@@ -2570,21 +1655,8 @@ class QtMainWindow(QMainWindow):
                 timer.stop()
             except Exception:
                 pass
-        try:
-            if self.run_controller is not None:
-                self.run_controller.stop()
-        except Exception:
-            pass
-        try:
-            if self.broker is not None:
-                self.broker.stop()
-        except Exception:
-            pass
-        try:
-            self.camera.stop()
-        except Exception:
-            pass
-        self.serial_log.close()
+        for tab in self.tabs:
+            tab.shutdown()
         try:
             self._save_window_state()
         except Exception:

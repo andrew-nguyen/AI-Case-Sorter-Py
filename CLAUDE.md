@@ -250,8 +250,25 @@ sanctioned way for worker threads to update the UI.
   `HeadstampParentRepo`, `SlotTemplateRepo`, `SettingsRepo`. All SQL is
   **parameterized**. `SettingsRepo` is a typed key/value store (JSON-encoded
   values) and holds `default_model_id` (the "active model").
-- **`config.py`** — `Config`: in-memory mirror of the `settings` sections (`api`,
-  `serial`, `image_proc`, `camera`) plus the canonical `DEFAULTS`. Headstamps are
+- **`sorters.py`** — the **sorter-tab roster** (§5, *Sorter tabs*). Each tab
+  drives one machine, and everything a machine owns is stored in `settings`
+  under `sorter:<id>:<name>` (`repository.sorter_key`): the `serial`,
+  `camera` and `image_proc` sections, `active_model_id`, the five `run_*`
+  options plus `sort_while_training` (`SORTER_SCOPED_SECTIONS` /
+  `SORTER_SCOPED_OPTIONS`), the live slot layouts and the active-template
+  pointers. This module owns the roster itself: the ordered `sorters` key,
+  id allocation (never reused), unique names, deletion (which removes the
+  tab's `sorter:<id>:` keys and nothing else — no model, image or template),
+  and the front-tab pointer `ui.front_sorter`. `ensure_default_sorter` is the
+  one-shot upgrade `__main__.py` calls after `Config.load()`: an install with
+  no roster becomes "Sorter 1", with its global keys **copied, not moved**,
+  so an older build opening the same database keeps working. No schema
+  change — the roster is configuration.
+- **`config.py`** — `Config(db, *, sorter_id)`: **one per sorter tab**. It is an
+  in-memory mirror of the tab's `settings` sections (`serial`, `image_proc`,
+  `camera`) and of the app-level `api` section, plus the canonical
+  `DEFAULTS`; reads and writes of per-tab values go through `_key`, which
+  prefixes `sorter:<id>:`. Headstamps are
   **not cached** — they're read fresh from the DB on every access (scoped to the
   active model; AI Config mode stashes them in a settings key). Also the home of
   routing logic: `slot_for_headstamp`, package-mode slot maps, parent
@@ -379,7 +396,11 @@ sanctioned way for worker threads to update the UI.
   startup; `CommunityApi` resolves both at construction, not import.
 
 ### Active-model concept
-"Active model" = `settings.default_model_id`. When **absent**, the app is in
+"Active model" = the tab's `sorter:<id>:active_model_id`, read as
+`Config.active_model_id`; several tabs may run the same model. Every
+`classifier` entry point takes `model_id=` as a required keyword, so the ml
+layer never reads a tab-less global. (The legacy `default_model_id` key is
+left in place by the upgrade for older builds and read by nothing else.) When **absent**, the app is in
 **AI Config mode** (HTTP classification via the app-level `config.api`,
 headstamps in a settings key). When **set**, that model is active with its
 headstamps in the `headstamps` table — a ConvNeXt model classifies locally
@@ -400,10 +421,21 @@ between them from the Sort page's template dropdown.
   (`{"headstamps": {name: slot}, "parents": {name: slot}}`, or
   `{"slots": {slot: [names]}}` for package mode) so a template survives a
   headstamp being deleted and re-added. Unknown names are ignored on apply.
-- **The live assignments stay authoritative.** A run still reads
-  `headstamps.slot` / `headstamp_parents.slot` / the package slot map — templates
-  never sit in the hot path. The *active* template (settings key
-  `active_slot_template:<model id|ai>:<mode>`) is kept in lock-step with them by
+- **Template definitions are shared; the layout and the choice are per tab.**
+  Two tabs on one model see the same template list, but each has its own
+  live layout and its own active template.
+- **The live assignments stay authoritative.** A run reads the tab's live
+  layout (`sorter:<id>:slots:<model id|ai>:<mode>`, the same payload shape a
+  template stores) — templates never sit in the hot path. The
+  `headstamps.slot` / `headstamp_parents.slot` columns and
+  `package_slots:<model|ai>` are now the model's **default** layout: a tab
+  copies them into its own layout the first time it reads that scope, and
+  from then on they no longer move that tab. The headstamp editor's "Slots
+  for" dropdown picks which one its Slot box edits — "Model default" or a
+  tab on which the edited model is active (never a tab running another
+  model, whose `set_headstamp_slot` would resolve *its* model). The *active*
+  template (settings key
+  `sorter:<id>:active_slot_template:<model id|ai>:<mode>`) is kept in lock-step with them by
   `Config.sync_active_slot_template()`, called from every slot mutation, so
   there is no explicit "save template" step. Switching is therefore a straight
   save-current / load-next swap (`activate_slot_template`), and applying a
@@ -460,11 +492,12 @@ between them from the Sort page's template dropdown.
   unplugging a real board.
 - **`serial_log.py`** — `SerialTrafficLog`: the file copy of the serial
   monitor's traffic, switched live by `config.serial["log_traffic"]` (Settings
-  → Serial; off by default). The window builds one beside the monitor and
-  `attach`es it to the same `serial/rx`/`serial/tx`/`serial/note` bus topics,
-  so the emulator's traffic is logged exactly like a board's. Writes run on
-  the drain (main) thread, buffered, with a flush at most once a second and
-  on switch-off and window close. One `logs/serial-<stamp>.log` per session
+  → Serial; off by default). Each sorter tab builds its own, because the
+  setting, the checkbox and the bus are all per tab, and `attach`es it to that
+  tab's `serial/rx`/`serial/tx`/`serial/note` bus topics, so the emulator's
+  traffic is logged exactly like a board's. Writes run on the drain (main)
+  thread, buffered, with a flush at most once a second and on switch-off and
+  tab or window close (`SorterTab.shutdown`). One `logs/serial-<stamp>.log` per session
   (re-enabling appends), rolled over past `MAX_SERIAL_LOG_BYTES` (5 MB), with
   `MAX_SERIAL_LOGS` kept through `paths.prune_session_logs`. Best-effort, like
   the training log: an I/O error switches it off with one warning and never
@@ -723,9 +756,11 @@ status bar (camera/serial indicators, an inference-device indicator —
 `refresh_device_indicator`, fed by `local_inference.device_description()`,
 warmed off-thread at startup by `_warm_device_indicator` and hidden in AI
 Config mode — update affordance, identity + sign-in)
-and File/View/Help menus. It owns the `EventBus`, `Camera`, `SerialBroker`,
-`RunController` and `AuthManager`, auto-connects serial/camera on startup, and
-runs the bus drain loop. `run_worker(fn, on_done, on_error)` is the standard
+and File/View/Help menus, all above a strip of [sorter tabs](#sorter-tabs).
+The window owns the app `EventBus`, the `AuthManager`, the device registry
+and the one bus drain loop; each `SorterTab` owns its own bus, `Camera`,
+`SerialBroker` and `RunController`, and the window auto-connects every tab's
+serial and camera on startup. `run_worker(fn, on_done, on_error)` is the standard
 helper for offloading blocking work to a thread and marshaling the result back
 through the bus.
 
@@ -804,17 +839,88 @@ torch, so declining costs only the predicted-label convenience and is
 remembered for the session. Call it on the **main thread only** (it opens a
 modal), and never gate on `is_available()`.
 
+### Sorter tabs
+The window drives **several machines at once**, one per tab in the
+`QTabBar#sorterTabs` strip above the body. `ui/sorter_tab.py`'s `SorterTab`
+is the per-machine half: its own `Config`, `EventBus`, `Camera`, broker and
+`RunController`, and its own instance of every per-machine page (Sort, Train,
+AI Config, and the Camera / Serial / Image Processing settings sections).
+Those pages are built with `build_*(tab)` exactly as they were once built
+with `build_*(window)`, so the tab exposes the attribute surface they read and
+delegates the shared parts to the window. **There is no forwarding property
+on the window** (`window.camera`, `window.slot_grid`, …): a page or test that
+silently reached "the front tab" is precisely the cross-machine bug this
+design exists to prevent, so tests say `tab(window)` from the UI conftest.
+
+- **Shared vs per tab.** The model library, Community, themes, sign-in, the
+  database, the model folders and the docks' layout are shared. One sidebar
+  and one outer `QStackedWidget` serve every tab; each per-tab surface is an
+  inner stack in `window.tab_stacks[name]` holding every tab's page, built
+  **eagerly**, because a background tab's Sort page must exist to count its
+  own cases (AC3). Models, Community and Settings are single instances;
+  Settings swaps the inner stacks for its three per-tab sections, and
+  `SETTINGS_SECTIONS` keeps its one tuple.
+- **One bus per tab, plus the app bus.** A tab's `run/*`, `test/*`,
+  `serial/*`, `mode/changed` and `feedback/*` never leave its own bus, so a
+  subscriber cannot see another machine's events by construction.
+  `window.bus` is the app bus (`models/changed`, `community/*`,
+  `sorters/updated`, `status`, `worker/*`). One 50 ms timer runs
+  `window.drain_all()`, which drains the tab buses **before** the app bus:
+  a tab handler posts `sorters/updated`, and draining the app bus second puts
+  the dashboard row on screen in the same tick.
+- **The front tab** (`window.current_tab`, persisted as `ui.front_sorter`)
+  is the only one the shared surfaces show. The serial monitor and
+  classification history docks `retarget(tab)` on switch — they move their
+  subscriptions and replay the tab's retained buffers (`serial_lines`,
+  `history_records`), so the buffers live on the tab, not the dock. Dock
+  titles gain " — <tab name>" only when there are several tabs, so one tab
+  looks exactly as the app always did. The status bar's indicators, device
+  label and model-update button read the front tab; a background tab's status
+  messages wait until it is in front.
+- **Devices are exclusive.** `ui/device_registry.py` records which tab holds
+  each serial port and camera index; every connect path claims first, and
+  both settings lists show a held device as "in use by <name>", disabled.
+  It lives in the UI layer because the holder is a tab. `EMULATED_PORT` is
+  exempt, so any number of tabs can run emulators.
+- **Startup auto-connect.** With one tab, today's full walk runs unchanged
+  (saved port first, then every probe candidate). With several, one worker
+  opens each tab's saved port in tab order (`open_saved_port_blocking`), and
+  `finish_saved_port` claims on the main thread — concurrent walks would race
+  for the same boards.
+- **The strip.** The "All sorters" dashboard is index 0 and can't be
+  renamed or closed. "+" (`newSorterButton`) adds "Sorter N" (lowest free
+  number); double-click renames through the `ask_text` seam; the close
+  buttons are our own `tabCloseButton` tool buttons, hidden while one sorter
+  remains; `confirm_close_tab` is the seam for the connected-or-running
+  confirmation. Tabs are not movable. A running tab carries a painted dot
+  icon in the palette's `action` colour with a "Running" tooltip, repainted
+  on theme switch.
+- **The dashboard** (`dashboard_page.py`) is one table row per tab, fed by
+  `sorters/updated` plus `tab.snapshot()` — no polling timer. It is rebuilt,
+  never sorted, because the per-row Start/Stop are item widgets. Those
+  buttons call the tab's own `toggle_run`, so the pre-flight checks
+  (`_ready_to_sort`) are the Sort page's code, not a copy.
+- **Models page Active column** shows `ACTIVE_MARK` with one tab and
+  "● <tab names>" with several; Activate writes the front tab's model and
+  posts `mode/changed` on that tab's bus.
+- **Local inference** still runs on one module-global executor, so two tabs
+  classifying locally queue behind each other. That is deliberate until
+  measured (the plan's D12).
+
 ### Surfaces
 | Activity | File | Purpose |
 |-----|------|---------|
-| **Sort** | `app.py` (+ `slot_grid.py`, `dialog_slot_assign.py`, `dialog_headstamp_assign.py`, `name_filter.py`) | Production sorting: the crop the classifier saw, the slot cards with live counts, sorting templates, Start/Stop/Manual feed, package-mode counters. Assignment is two dialogs over the same Config calls: bin-first (click a card) and headstamp-first ("Assign by headstamp…", every row's slot set from the keyboard); both filter through `name_filter`. |
+| **All sorters** | `dashboard_page.py` | One row per sorter tab: board, camera, model, run state, cases, last result and crop; per-row Start/Stop; click a name to open that tab. |
+| **Sort** | `sorter_tab.py` (+ `slot_grid.py`, `dialog_slot_assign.py`, `dialog_headstamp_assign.py`, `name_filter.py`) | Production sorting: the crop the classifier saw, the slot cards with live counts, sorting templates, Start/Stop/Manual feed, package-mode counters. Assignment is two dialogs over the same Config calls: bin-first (click a card) and headstamp-first ("Assign by headstamp…", every row's slot set from the keyboard); both filter through `name_filter`. |
 | **Models** | `models_page.py` | Model library: browse/filter/sort, create, edit, **activate**, import/export, delete. Synthetic "Use AI Config" row. |
 | **Train** | `train_page.py` | Feed→capture→classify→label→save loop; "Sort While Training"; launches training. |
 | **AI Config** | `ai_page.py` | HTTP server config (endpoint/key/model/prompt/encoding), headstamp manager, single-shot test. |
 | **Community** | `community_page.py` | Browse/search/download community models; share entry point. Auth-gated. |
 | **Settings** | `settings_{camera,serial,imageproc}.py` + `app.py`'s Theme section + `dialog_winforms_import.py` | Camera, Serial, Image Processing, Theme, Import from Windows — listed in `SETTINGS_SECTIONS`, reached by name. |
 
-Docks: `serial_monitor.py`, `history_view.py`, `help_viewer.py`,
+Sort, Train, AI Config and the Camera / Serial / Image Processing sections are
+per sorter tab; the rest are single instances. Docks: `serial_monitor.py`,
+`history_view.py` (both follow the front tab), `help_viewer.py`,
 `messages_view.py`, and the Themes panel in `app.py`. Dialogs are `dialog_*.py`.
 
 ### Conventions, each one load-bearing
@@ -1059,7 +1165,7 @@ and must never be committed.
 ```
 <data root>/
 ├── config/
-│   ├── casesorter.db      # SQLite (all settings, models, headstamps)
+│   ├── casesorter.db      # SQLite (all settings, models, headstamps; per-tab keys under sorter:<id>:)
 │   └── msal_cache.bin     # MSAL token cache (chmod 0600 on POSIX)
 ├── models/
 │   └── <model_id>/

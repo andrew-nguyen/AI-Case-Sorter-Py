@@ -130,7 +130,7 @@ class ImageProcSection(QWidget):
 
     def _active_model(self) -> Model | None:
         """The active model, re-read every time — never a snapshot to write back."""
-        model_id = self._win.config.settings.get_active_model_id()
+        model_id = self._win.config.active_model_id
         if model_id is None:  # AI Config mode: the global settings are the scope
             return None
         return ModelRepo(self._win.config.db).get(model_id)

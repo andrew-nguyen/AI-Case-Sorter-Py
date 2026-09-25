@@ -9,7 +9,7 @@ import pytest
 from sorter.data.config import DEFAULT_SLOT_TEMPLATE_NAME, Config
 from sorter.data.db import Database
 from sorter.data.models import Model
-from sorter.data.repository import HeadstampParentRepo, ModelRepo, SettingsRepo, SlotTemplateRepo
+from sorter.data.repository import HeadstampParentRepo, ModelRepo, SlotTemplateRepo
 
 
 def _new_db(tmp_path: Path) -> Database:
@@ -20,14 +20,14 @@ def _new_db(tmp_path: Path) -> Database:
 
 def _activate_seeded_model(db: Database) -> int:
     seed = ModelRepo(db).list()[0]
-    SettingsRepo(db).set_active_model_id(seed.id)
+    Config(db, sorter_id=1).set_active_model_id(seed.id)
     return seed.id
 
 
 def _cfg(tmp_path: Path) -> Config:
     db = _new_db(tmp_path)
     _activate_seeded_model(db)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     cfg.add_headstamp("WIN")
     cfg.add_headstamp("FC")
     cfg.add_headstamp("CBC")
@@ -108,7 +108,7 @@ def test_applying_a_template_clears_slots_it_does_not_mention(tmp_path: Path) ->
 
 def test_parent_slots_travel_with_the_template(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
-    mid = cfg.settings.get_active_model_id()
+    mid = cfg.active_model_id
     assert mid is not None
     parent = HeadstampParentRepo(cfg.db).add(mid, "Federal")
     cfg.set_parent_slot(parent.id, 4)
@@ -206,7 +206,7 @@ def test_package_mode_has_its_own_template_list(tmp_path: Path) -> None:
 def test_templates_are_scoped_per_model(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     first = _activate_seeded_model(db)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     cfg.add_headstamp("WIN", slot=2)
     cfg.create_slot_template("Model one layout")
 
@@ -220,10 +220,10 @@ def test_templates_are_scoped_per_model(tmp_path: Path) -> None:
             model_mode="convnext_tiny",
         )
     )
-    SettingsRepo(db).set_active_model_id(second.id)
+    Config(db, sorter_id=1).set_active_model_id(second.id)
 
     assert [t.name for t in cfg.list_slot_templates()] == [DEFAULT_SLOT_TEMPLATE_NAME]
-    SettingsRepo(db).set_active_model_id(first)
+    Config(db, sorter_id=1).set_active_model_id(first)
     assert sorted(t.name for t in cfg.list_slot_templates()) == [
         DEFAULT_SLOT_TEMPLATE_NAME,
         "Model one layout",
@@ -232,7 +232,7 @@ def test_templates_are_scoped_per_model(tmp_path: Path) -> None:
 
 def test_ai_config_mode_has_its_own_templates(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
-    cfg = Config(db).load()  # no active model -> AI Config mode
+    cfg = Config(db, sorter_id=1).load()  # no active model -> AI Config mode
     cfg.add_headstamp("WIN")
     cfg.set_headstamp_slot("WIN", 4)
 
@@ -249,7 +249,7 @@ def test_ai_config_mode_has_its_own_templates(tmp_path: Path) -> None:
 def test_templates_are_dropped_with_their_model(tmp_path: Path) -> None:
     db = _new_db(tmp_path)
     first = _activate_seeded_model(db)
-    cfg = Config(db).load()
+    cfg = Config(db, sorter_id=1).load()
     cfg.create_slot_template("Doomed")
 
     models = ModelRepo(db)
@@ -262,6 +262,7 @@ def test_templates_are_dropped_with_their_model(tmp_path: Path) -> None:
             model_mode="convnext_tiny",
         )
     )
-    models.delete(first, replacement_active_id=keeper.id)
+    cfg.set_active_model_id(keeper.id)
+    models.delete(first)
 
     assert SlotTemplateRepo(db).list_for_scope(first, "standard") == []

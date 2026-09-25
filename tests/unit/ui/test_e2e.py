@@ -47,7 +47,7 @@ from sorter import paths
 from sorter.control.run_controller import RunController
 from sorter.data.config import Config
 from sorter.data.models import Model
-from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo, SettingsRepo
+from sorter.data.repository import CartridgeRepo, HeadstampRepo, ModelRepo
 from sorter.hardware.serial_emulator import EMULATED_PORT, EmulatorBroker
 from sorter.ml import classifier, local_inference
 from sorter.ui import settings_camera
@@ -58,7 +58,7 @@ from sorter.ui.dialog_template import NewTemplateDialog
 from sorter.ui.models_page import ACTIVE_MARK, COLUMNS
 from sorter.ui.slot_grid import EMPTY_HINT
 
-from .conftest import drain_until, seed_model
+from .conftest import drain_until, seed_model, tab
 
 CAMERA_METADATA = [
     {"index": 0, "name": "USB Webcam", "resolutions": [(640, 480), (1280, 720)]},
@@ -105,7 +105,7 @@ class FakeCamera:
 def stub_camera(window: Any) -> None:
     """A camera that always hands back one synthetic frame, never a device."""
     frame = np.zeros((480, 640, 3), np.uint8)
-    window.camera = types.SimpleNamespace(
+    tab(window).camera = types.SimpleNamespace(
         capture_frame=lambda: frame,
         latest_frame=lambda: None,
         stop=lambda: None,
@@ -127,11 +127,15 @@ def open_settings(window: Any, name: str) -> Any:
     items = window.settings_list.findItems(name, Qt.MatchFlag.MatchExactly)
     assert items, f"no Settings section named {name!r}"
     window.settings_list.setCurrentItem(items[0])
-    return window.settings_pages.currentWidget()
+    page = window.settings_pages.currentWidget()
+    # Camera, Serial and Image Processing are per sorter tab: the section is
+    # a stack of every tab's page, turned to the tab in front.
+    stack = window.tab_stacks.get(name)
+    return stack.currentWidget() if page is stack else page
 
 
 def card_counts(window: Any) -> dict[int, int]:
-    return {slot: int(card.count_label.text()) for slot, card in window.slot_grid.cards.items()}
+    return {slot: int(card.count_label.text()) for slot, card in tab(window).slot_grid.cards.items()}
 
 
 def give_checkpoint(config: Any, model_id: int) -> None:
@@ -179,43 +183,43 @@ def test_demo_a_full_sorting_session(config, window_factory, monkeypatch) -> Non
     serial_page.port_combo.setCurrentText(EMULATED_PORT)
     serial_page.connect_button.click()
 
-    assert isinstance(window.broker, EmulatorBroker)
-    assert isinstance(window.run_controller, RunController)
+    assert isinstance(tab(window).broker, EmulatorBroker)
+    assert isinstance(tab(window).run_controller, RunController)
     assert "connected" in window.serial_label.text()
 
     # 2. Back to the dashboard: the cards already show what routes where.
     window.sidebar_buttons["Sort"].click()
-    assert window.slot_grid.cards[2].names_label.text() == "9mm FC"
-    assert window.slot_grid.cards[3].names_label.text() == ".223 LC"
-    assert window.run_button.isEnabled()
-    assert window.run_button.text() == "Start"
+    assert tab(window).slot_grid.cards[2].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[3].names_label.text() == ".223 LC"
+    assert tab(window).run_button.isEnabled()
+    assert tab(window).run_button.text() == "Start"
 
     # 3. Run several cases. The one button turns into Stop as the run starts.
-    window.run_button.click()
-    assert drain_until(window, lambda: window._is_running)
-    assert window.run_button.text() == "Stop"
-    assert window.run_button.objectName() == "danger"
-    assert not window.action_buttons["Manual feed"].isEnabled()
-    assert drain_until(window, lambda: window._master_count >= 4, timeout_s=30), "the run never sorted four cases"
+    tab(window).run_button.click()
+    assert drain_until(window, lambda: tab(window)._is_running)
+    assert tab(window).run_button.text() == "Stop"
+    assert tab(window).run_button.objectName() == "danger"
+    assert not tab(window).action_buttons["Manual feed"].isEnabled()
+    assert drain_until(window, lambda: tab(window)._master_count >= 4, timeout_s=30), "the run never sorted four cases"
 
     # 4. Stop cleanly — same button, its other face.
-    window.run_button.click()
-    assert drain_until(window, lambda: not window._is_running), "the run never stopped"
-    assert window.run_button.text() == "Start"
-    assert window.run_button.objectName() == "action"
+    tab(window).run_button.click()
+    assert drain_until(window, lambda: not tab(window)._is_running), "the run never stopped"
+    assert tab(window).run_button.text() == "Start"
+    assert tab(window).run_button.objectName() == "action"
 
     # What the demo shows, in the order a viewer reads it.
-    sorted_cases = window._master_count
+    sorted_cases = tab(window)._master_count
     counts = card_counts(window)
-    assert window.master_count_label.text() == str(sorted_cases)
+    assert tab(window).master_count_label.text() == str(sorted_cases)
     assert sum(counts.values()) == sorted_cases, "the cards and the master counter disagree"
     assert counts[2] > 0 and counts[3] > 0, f"both configured slots should have filled: {counts}"
     assert counts[0] == 0, "nothing was below the floor, so the catch-all stays empty"
 
     # The current case, front and centre: its crop, its label, its confidence.
-    assert window.result_label.text() in ("9mm FC", ".223 LC")
-    assert window.result_confidence_label.text() == "96%"
-    assert not window.crop_label.pixmap().isNull(), "the last cropped headstamp is never shown"
+    assert tab(window).result_label.text() in ("9mm FC", ".223 LC")
+    assert tab(window).result_confidence_label.text() == "96%"
+    assert not tab(window).crop_label.pixmap().isNull(), "the last cropped headstamp is never shown"
 
     # The history dock saw every classification (it is posted before the sort
     # completes, so it can only ever lead the counter).
@@ -237,9 +241,9 @@ def test_demo_a_full_sorting_session(config, window_factory, monkeypatch) -> Non
 
     # Counts survive Stop (jam-clearing): only an explicit reset
     # clears them, and that one also zeroes the run's package batches.
-    window.reset_counts()
+    tab(window).reset_counts()
     assert card_counts(window) == dict.fromkeys(counts, 0)
-    assert window.master_count_label.text() == "0"
+    assert tab(window).master_count_label.text() == "0"
 
 
 # ----- (b) settings round-trip across a restart -------------------------------
@@ -253,7 +257,7 @@ def test_demo_b_settings_survive_a_restart(config, window_factory, monkeypatch) 
     happens to still hold.
     """
     monkeypatch.setattr(settings_camera, "camera_names", lambda: {})
-    monkeypatch.setattr(settings_camera, "list_cameras_with_metadata", lambda: CAMERA_METADATA)
+    monkeypatch.setattr(settings_camera, "list_cameras_with_metadata", lambda **_: CAMERA_METADATA)
     monkeypatch.setattr(settings_camera, "Camera", FakeCamera)
 
     window = window_factory(config)
@@ -282,16 +286,16 @@ def test_demo_b_settings_survive_a_restart(config, window_factory, monkeypatch) 
 
     # Run options: the confidence floor, package mode and its batch size.
     window.sidebar_buttons["Sort"].click()
-    window.floor_spin.setValue(77)
-    window.package_check.setChecked(True)
-    window.batch_spin.setValue(25)
+    tab(window).floor_spin.setValue(77)
+    tab(window).package_check.setChecked(True)
+    tab(window).batch_spin.setValue(25)
     window.close()
 
     # Relaunch on the same database.
-    restarted = window_factory(Config(config.db).load())
+    restarted = window_factory(Config(config.db, sorter_id=1).load())
 
-    assert restarted.camera.device_index == 1
-    assert (restarted.camera.width, restarted.camera.height) == (320, 240)
+    assert tab(restarted).camera.device_index == 1
+    assert (tab(restarted).camera.width, tab(restarted).camera.height) == (320, 240)
     restarted.sidebar_buttons["Settings"].click()
     assert open_settings(restarted, "Camera").resolution_combo.currentText() == "320 x 240"
 
@@ -299,18 +303,18 @@ def test_demo_b_settings_survive_a_restart(config, window_factory, monkeypatch) 
     assert serial_again.slot_count_spin.value() == 5
     assert serial_again._init_widgets["feedspeed"].value() == 123
     assert serial_again.init_on_startup_check.isChecked()
-    assert sorted(restarted.slot_grid.cards) == [0, 1, 2, 3, 4], "the slot count didn't reach the grid"
+    assert sorted(tab(restarted).slot_grid.cards) == [0, 1, 2, 3, 4], "the slot count didn't reach the grid"
 
     imageproc_again = open_settings(restarted, "Image Processing")
     assert imageproc_again.min_radius_spin.value() == 111
     assert imageproc_again.primer_mode_combo.currentData() == "none"
 
-    assert restarted.floor_spin.value() == 77
-    assert restarted.package_check.isChecked()
-    assert restarted.batch_spin.value() == 25
+    assert tab(restarted).floor_spin.value() == 77
+    assert tab(restarted).package_check.isChecked()
+    assert tab(restarted).batch_spin.value() == 25
 
     # And the same answers read straight out of a third Config.
-    stored = Config(config.db).load()
+    stored = Config(config.db, sorter_id=1).load()
     assert stored.camera["width"] == 320 and stored.camera["device_index"] == 1
     assert stored.serial["init_settings"]["feedspeed"] == 123
     assert stored.serial["slot_quantity"] == 5
@@ -357,7 +361,7 @@ def test_demo_c_model_lifecycle(config, window, monkeypatch, tmp_path) -> None:
     activate_row(page, created.id)
     assert drain_until(window, lambda: not window.sidebar_buttons["Train"].property("unavailable"))
     assert page.tree.currentItem().text(COLUMNS.index("Active")) == ACTIVE_MARK
-    assert SettingsRepo(config.db).get_active_model_id() == created.id
+    assert config.active_model_id == created.id
 
     # 3. Headstamps, through the manager the Models page opens.
     def add_headstamps(dialog: Any) -> None:
@@ -373,8 +377,8 @@ def test_demo_c_model_lifecycle(config, window, monkeypatch, tmp_path) -> None:
     # 4. Route one of them, through the slot card's own editor.
     script_dialog(monkeypatch, SlotAssignDialog, lambda dialog: dialog.checkboxes["9mm FC"].click())
     window.sidebar_buttons["Sort"].click()
-    window.open_slot_editor(1)
-    assert window.slot_grid.cards[1].names_label.text() == "9mm FC"
+    tab(window).open_slot_editor(1)
+    assert tab(window).slot_grid.cards[1].names_label.text() == "9mm FC"
 
     # 5. Export the model, then import the archive back as a second copy.
     window.sidebar_buttons["Models"].click()
@@ -407,8 +411,8 @@ def test_demo_c_model_lifecycle(config, window, monkeypatch, tmp_path) -> None:
     # 6. Activate the copy: the dashboard follows the active model, so the
     #    slot the original had routed is empty again.
     activate_row(page, imported.id)
-    assert drain_until(window, lambda: SettingsRepo(config.db).get_active_model_id() == imported.id)
-    assert window.slot_grid.cards[1].names_label.text() == EMPTY_HINT
+    assert drain_until(window, lambda: config.active_model_id == imported.id)
+    assert tab(window).slot_grid.cards[1].names_label.text() == EMPTY_HINT
     assert not window.sidebar_buttons["Train"].property("unavailable")
     # ...and AI Config, its mirror, is the muted half of the pair.
     assert window.sidebar_buttons["AI Config"].property("unavailable") is True
@@ -420,20 +424,21 @@ def test_demo_c_model_lifecycle(config, window, monkeypatch, tmp_path) -> None:
     assert drain_until(window, lambda: window.sidebar_buttons["Train"].property("unavailable"))
     assert not window.sidebar_buttons["Train"].isHidden()
     assert not window.sidebar_buttons["AI Config"].property("unavailable")
-    assert SettingsRepo(config.db).get_active_model_id() is None
+    assert config.active_model_id is None
 
     window.sidebar_buttons["Train"].click()
     assert window.pages.currentWidget() is window._pages_by_name["Train"]
-    assert not window.train_page.is_available()
+    assert not tab(window).train_page.is_available()
 
     # And the muted AI Config, back on the imported model, lands on its own
     # page's explainer, which names the model classifying instead.
     activate_row(page, imported.id)
     assert drain_until(window, lambda: window.sidebar_buttons["AI Config"].property("unavailable") is True)
     window.sidebar_buttons["AI Config"].click()
-    assert window.pages.currentWidget() is window.ai_page
-    assert not window.ai_page.is_available()
-    assert imported.name in window.ai_page.notice_label.text()
+    assert window.pages.currentWidget() is window._pages_by_name["AI Config"]
+    assert window.tab_stacks["AI Config"].currentWidget() is tab(window).ai_page
+    assert not tab(window).ai_page.is_available()
+    assert imported.name in tab(window).ai_page.notice_label.text()
 
 
 def select_model(page: Any, model_id: int) -> None:
@@ -455,7 +460,7 @@ def activate_row(page: Any, model_id: int) -> None:
 
 
 def template_names(window: Any) -> list[str]:
-    return [window.template_combo.itemText(i) for i in range(window.template_combo.count())]
+    return [tab(window).template_combo.itemText(i) for i in range(tab(window).template_combo.count())]
 
 
 def pick_template(window: Any, name: str) -> None:
@@ -465,15 +470,15 @@ def pick_template(window: Any, name: str) -> None:
     user-only by design, so repopulating the combo can't look like a switch),
     hence the explicit handler call.
     """
-    window.template_combo.setCurrentIndex(template_names(window).index(name))
-    window._on_template_selected(window.template_combo.currentIndex())
+    tab(window).template_combo.setCurrentIndex(template_names(window).index(name))
+    tab(window)._on_template_selected(tab(window).template_combo.currentIndex())
 
 
 def test_demo_c2_sorting_templates_swap_the_whole_layout(config, window, monkeypatch) -> None:
     """Two bin layouts for one model, switched from the Run bar."""
     seed_model(config, {"9mm FC": 1})
-    window.bus.post("mode/changed", None)
-    window.bus.drain()
+    tab(window).bus.post("mode/changed", None)
+    window.drain_all()
     assert template_names(window) == ["Default"]
 
     # A second layout, copied from the current one.
@@ -484,28 +489,28 @@ def test_demo_c2_sorting_templates_swap_the_whole_layout(config, window, monkeyp
         dialog.create_template()
 
     script_dialog(monkeypatch, NewTemplateDialog, name_it)
-    window.new_template()
+    tab(window).new_template()
 
     assert template_names(window) == ["Default", "Match prep"]
-    assert window.template_combo.currentText() == "Match prep"
-    assert window.slot_grid.cards[1].names_label.text() == "9mm FC"
+    assert tab(window).template_combo.currentText() == "Match prep"
+    assert tab(window).slot_grid.cards[1].names_label.text() == "9mm FC"
 
     # Re-route inside the new layout only.
     script_dialog(monkeypatch, SlotAssignDialog, lambda dialog: dialog.checkboxes["9mm FC"].click())
-    window.open_slot_editor(4)
-    assert window.slot_grid.cards[4].names_label.text() == "9mm FC"
-    assert window.slot_grid.cards[1].names_label.text() == EMPTY_HINT
+    tab(window).open_slot_editor(4)
+    assert tab(window).slot_grid.cards[4].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[1].names_label.text() == EMPTY_HINT
 
     # Switching back restores the layout Default was left holding — the live
     # assignments stay authoritative, so this is a real reassignment.
     pick_template(window, "Default")
-    assert window.slot_grid.cards[1].names_label.text() == "9mm FC"
-    assert window.slot_grid.cards[4].names_label.text() == EMPTY_HINT
+    assert tab(window).slot_grid.cards[1].names_label.text() == "9mm FC"
+    assert tab(window).slot_grid.cards[4].names_label.text() == EMPTY_HINT
     assert config.slot_for_headstamp("9mm FC") == 1
 
     pick_template(window, "Match prep")
-    assert window.slot_grid.cards[4].names_label.text() == "9mm FC"
-    assert Config(config.db).load().slot_for_headstamp("9mm FC") == 4
+    assert tab(window).slot_grid.cards[4].names_label.text() == "9mm FC"
+    assert Config(config.db, sorter_id=1).load().slot_for_headstamp("9mm FC") == 4
 
 
 # ----- (d) F1 follows the user ------------------------------------------------
@@ -587,10 +592,10 @@ def test_demo_e_start_refuses_a_model_that_cannot_classify(config, window_factor
     serial_page.connect_button.click()
 
     window.sidebar_buttons["Sort"].click()
-    window.run_button.click()
+    tab(window).run_button.click()
 
     assert window.notify.titles == ["Model not ready"]
-    assert not window.run_controller.is_running
+    assert not tab(window).run_controller.is_running
     assert window.serial_monitor.output.toPlainText().count("-> xf:") == 0, "a case was fed anyway"
 
 

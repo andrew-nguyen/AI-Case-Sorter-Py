@@ -6,7 +6,7 @@ Run this with the same interpreter the app uses, from the repo root:
     Linux:    .venv/bin/python tools/diagnose_active_model.py
 
 `classify_active` picks local inference only when ALL of these hold:
-  * a model is active (settings.default_model_id is set)
+  * a model is active on the sorter tab in front (its active_model_id is set)
   * that row still exists
   * its model_path is non-empty
   * the file at model_path exists on disk
@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sorter import paths
 from sorter.data.db import Database
-from sorter.data.repository import ModelRepo, SettingsRepo
+from sorter.data.repository import ACTIVE_MODEL_NAME, ModelRepo, SettingsRepo, sorter_key
+from sorter.data.sorters import front_sorter_id, list_sorters
 
 
 def main() -> int:
@@ -41,8 +42,16 @@ def main() -> int:
     settings = SettingsRepo(db)
     models = ModelRepo(db)
 
-    active_id = settings.get_active_model_id()
-    print(f"\nactive model id (settings.default_model_id) = {active_id!r}")
+    # The active model is per sorter tab; the one in front is what a run uses
+    # unless you switch tabs.
+    roster = list_sorters(db)
+    sorter_id = front_sorter_id(db) or (roster[0].id if roster else None)
+    if sorter_id is None:
+        print('\n-> No sorter tabs yet. Launch the app once to create "Sorter 1".')
+        return 1
+    key = sorter_key(sorter_id, ACTIVE_MODEL_NAME)
+    active_id = settings.get(key)
+    print(f"\nactive model id ({key}) = {active_id!r}")
     if active_id is None:
         print("-> AI Config mode. Every classification goes over HTTP.")
         print("   Fix: activate a model on the Models tab.")
@@ -51,7 +60,7 @@ def main() -> int:
 
     model = models.get(active_id)
     if model is None:
-        print(f"-> default_model_id={active_id} points at a row that no longer exists.")
+        print(f"-> {key}={active_id} points at a row that no longer exists.")
         print("   Fix: re-activate a model on the Models tab.")
         _print_library(models)
         return 1
